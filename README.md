@@ -61,7 +61,7 @@ extract_token_vectors(
 )
 ```
 
-### Train and evaluate a model:
+### Evaluate a model:
 
 ```python
 from plug.model import load_npz_features, cross_validate
