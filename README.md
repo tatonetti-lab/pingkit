@@ -7,7 +7,7 @@ Pattern Learning for Understanding Generation, or **Plug**, is a Python package 
 
 ---
 
-## 🚀 Features
+## Features
 
 - **Efficient Embedding Extraction**: Capture last-token embeddings from transformer models (e.g., Gemma, GPT-2, etc.).
 - **Flexible Aggregation**: Easily aggregate embeddings across layers and model components (attention, MLP, residual streams).
@@ -16,19 +16,19 @@ Pattern Learning for Understanding Generation, or **Plug**, is a Python package 
 
 ---
 
-## 📦 Installation
+## Installation
 
 Install from source:
 
 ```bash
-git clone https://github.com/yourusername/plug.git
+git clone https://github.com/tatonetti-lab/plug.git
 cd plug
 pip install .
 ```
 
 ---
 
-## 🛠️ Quickstart
+## Quickstart
 
 ### Extract embeddings from a HuggingFace model:
 
@@ -85,20 +85,20 @@ preds = cross_validate(
 
 ---
 
-## 📖 Documentation
+## Documentation
 
 Detailed documentation is coming soon. For now, please refer to the inline docstrings and examples provided in the source code.
 
 ---
 
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request on GitHub.
 
 ---
 
-## 📜 License
+## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
