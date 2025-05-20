@@ -2,9 +2,8 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/downloads/)
-[![PyPI](https://img.shields.io/pypi/v/plug.svg)](https://pypi.org/project/plug/)
 
-**Plug** is a Python package designed to simplify modeling using transformer-based embeddings. It provides optimized utilities for capturing last-token activations from HuggingFace AutoModels, aggregating embeddings into structured datasets, and training robust neural network models.
+Pattern Learning for Understanding Generation, or **Plug**, is a Python package designed to simplify modeling using transformer-based embeddings. It provides optimized utilities for capturing last-token activations from HuggingFace AutoModels, aggregating embeddings into structured datasets, and training robust neural network models.
 
 ---
 
