@@ -71,7 +71,7 @@ y = pd.read_csv("data/labels.csv", index_col="id")
 
 preds = cross_validate(
     X, y,
-    model_type="cnn",
+    model_type="mlp",
     task="classification",
     meta=meta,
     n_epochs=50,
