@@ -42,8 +42,8 @@ embed_dataset(
     output_dir="embeddings",
     device="cuda:0",
     layers=[0, 1, 7],
-    parts=["rs", "mlp"],
-    eos_token="<eos>"
+    parts=["attn", "mlp", "rs"],
+    eos_token="<end_of_turn>"
 )
 ```
 
