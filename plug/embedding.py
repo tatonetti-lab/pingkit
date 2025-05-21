@@ -21,13 +21,20 @@ def load_model_and_tokenizer(
     model_name: str = "google/gemma-2-9b-it",
     *,
     device: str | int | None = None,
+    use_data_parallel: bool = True,
 ):
-    """Load and cache model + tokenizer."""
+    """Load and cache model + tokenizer, optionally using DataParallel."""
     LOGGER.info("Loading model %s", model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name, output_hidden_states=True).eval()
+
     if device is not None:
         model = model.to(device)
+
+    if use_data_parallel and torch.cuda.device_count() > 1:
+        LOGGER.info("Using DataParallel with %d GPUs", torch.cuda.device_count())
+        model = torch.nn.DataParallel(model)
+
     return model, tokenizer
 
 def _get_blocks(model):
