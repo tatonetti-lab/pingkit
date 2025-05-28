@@ -1,70 +1,95 @@
 from __future__ import annotations
-import os
+
+# standard library
 import json
 import logging
+import math
+import os
 import time
-from typing import Tuple, Union
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Callable, Iterable, Tuple, Union
+
+# third‑party
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from sklearn.model_selection import StratifiedKFold, LeaveOneGroupOut
 from sklearn.metrics import (
-    roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
 )
+from sklearn.model_selection import LeaveOneGroupOut, StratifiedKFold, StratifiedShuffleSplit
+from tqdm import tqdm
+
+plt.switch_backend("Agg")  # headless‑safe
 
 LOGGER = logging.getLogger(__name__)
 __all__ = [
     "PlugClassifier",
     "PlugContrastiveCNN",
-    # training helpers
-    "cross_validate", "fit",
-    # I/O helpers
-    "save_artifacts", "load_artifacts", "predict",
+    "fit",
+    "cross_validate",
+    "save_artifacts",
+    "load_artifacts",
+    "predict",
     "load_npz_features",
 ]
 
+# helpers
+
+def _select_device(preferred: str | torch.device = "cuda") -> torch.device:
+    """Return a usable device, falling back to CPU if CUDA is unavailable."""
+    return torch.device(preferred if torch.cuda.is_available() else "cpu")
+
+
+def _json_encode(obj):
+    """Handle NumPy scalars / arrays when dumping JSON."""
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"{type(obj)} cannot be JSON‑encoded")
+
+
+# model definitions
 
 class PlugClassifier(nn.Module):
-    # Three‑layer residual MLP whose width is chosen so that the total
-    # number of trainable parameters is **approximately
-    # target_ratio × n_examples.**
-    #
-    # For tabular data a target_ratio of 3‑10 is usually plenty; the
-    # default 5 keeps capacity modest even for small data sets.
+    """Width‑scaling MLP for tabular data."""
+
     def __init__(
         self,
         input_dim: int,
         num_classes: int = 2,
         *,
         n_examples: int | None = None,
-        target_ratio: float = 5.0,      # max desired (params / samples)
+        target_ratio: float = 5.0,
         p_drop: float = 0.3,
         out_floor: int = 16,
-        width_cap: int = 128,           # hard upper bound for fc1
+        width_cap: int = 128,
     ):
         super().__init__()
+        self.n_examples = n_examples
+        self.target_ratio = target_ratio
+        self.p_drop = p_drop
+        self.width_cap = width_cap
 
-        # ------------------------------------------------------------------
-        # Determine fc1 width ------------------------------------------------
-        # ------------------------------------------------------------------
         if n_examples is None:
-            # Inference‑time path: fall back to a tiny network
             fc1_w = 32
         else:
-            # Solve   params ≈ input_dim * fc1   ⇒  fc1 ≈ target·N / d
             est_fc1 = int(target_ratio * n_examples / input_dim)
             fc1_w = int(np.clip(est_fc1, 16, width_cap))
 
         fc2_w = max(16, fc1_w // 2)
         out_w = max(out_floor, fc2_w // 4)
 
-        # Helper for a dense block
-        def block(i, o):
+        def _block(i: int, o: int) -> nn.Sequential:
             return nn.Sequential(
                 nn.Linear(i, o),
                 nn.BatchNorm1d(o),
@@ -72,33 +97,32 @@ class PlugClassifier(nn.Module):
                 nn.Dropout(p_drop),
             )
 
-        # Layers
-        self.fc1 = block(input_dim, fc1_w)
-        self.fc2 = block(fc1_w, fc2_w)
-        self.res = nn.Sequential(block(fc2_w, fc2_w),
-                                 nn.Linear(fc2_w, fc2_w))   # residual
-        self.out = nn.Sequential(block(fc2_w, out_w),
-                                 nn.Linear(out_w, num_classes))
+        self.fc1 = _block(input_dim, fc1_w)
+        self.fc2 = _block(fc1_w, fc2_w)
+        self.res = nn.Sequential(_block(fc2_w, fc2_w), nn.Linear(fc2_w, fc2_w))
+        self.out = nn.Sequential(_block(fc2_w, out_w), nn.Linear(out_w, num_classes))
 
-        # Log capacity
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         LOGGER.info(
             "PlugClassifier • d=%d N=%s target=%.1f ⇒ fc1=%d params=%d (≈%.1f×N)",
-            input_dim, n_examples, target_ratio, fc1_w,
-            n_params, n_params / (n_examples or 1)
+            input_dim,
+            n_examples,
+            target_ratio,
+            fc1_w,
+            n_params,
+            n_params / (n_examples or 1),
         )
 
-    def forward(self, x):               # x: (B, d)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc1(x)
         x = self.fc2(x)
         x = x + self.res(x)
-        return self.out(x)              # logits (B, C)
-
+        return self.out(x)  # logits
 
 
 class PlugCNNEncoder(nn.Module):
-    # Capacity‑aware CNN encoder.  Stores self.proj_dim so the caller can
-    # build a classifier without poking into the backbone.
+    """Capacity‑aware CNN encoder for 1‑D or grid‑like inputs."""
+
     def __init__(
         self,
         n_parts: int,
@@ -112,50 +136,55 @@ class PlugCNNEncoder(nn.Module):
         p_drop: float = 0.1,
     ):
         super().__init__()
-        self.use_1d = (n_parts == 1)
+        self.use_1d = n_parts == 1
         in_ch = n_layers
 
-        # ---- choose base width -------------------------------------------------
-        if n_examples is None:
-            base = 16
-        else:
-            base = int(np.clip(np.sqrt(target_ratio * n_examples / 10), 8, width_cap))
-
-        c1 = base
-        c2 = base * 2
-        self.proj_dim = max(32, base * proj_mult)   # <‑‑ store here
+        base = 16 if n_examples is None else int(np.clip(np.sqrt(target_ratio * n_examples / 10), 8, width_cap))
+        c1, c2 = base, base * 2
+        self.proj_dim = max(32, base * proj_mult)
 
         self.layer_norm = nn.LayerNorm(hidden)
 
-        # ---- backbone ----------------------------------------------------------
         if self.use_1d:
             self.backbone = nn.Sequential(
-                nn.Conv1d(in_ch, c1, 5, padding=2), nn.BatchNorm1d(c1), nn.ReLU(),
-                nn.Conv1d(c1, c2, 3, padding=1),    nn.BatchNorm1d(c2), nn.ReLU(),
-                nn.Conv1d(c2, self.proj_dim, 1), nn.ReLU(),
-                nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Dropout(p_drop),
+                nn.Conv1d(in_ch, c1, 5, padding=2),
+                nn.BatchNorm1d(c1),
+                nn.ReLU(),
+                nn.Conv1d(c1, c2, 3, padding=1),
+                nn.BatchNorm1d(c2),
+                nn.ReLU(),
+                nn.Conv1d(c2, self.proj_dim, 1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Dropout(p_drop),
             )
         else:
             k_h = 3 if n_parts > 2 else n_parts
             self.backbone = nn.Sequential(
                 nn.Conv2d(in_ch, c1, (k_h, 5), padding=(k_h // 2, 2)),
-                nn.BatchNorm2d(c1), nn.ReLU(),
-                nn.Conv2d(c1, c2, 1), nn.BatchNorm2d(c2), nn.ReLU(),
-                nn.Conv2d(c2, self.proj_dim, 1), nn.ReLU(),
-                nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Dropout(p_drop),
+                nn.BatchNorm2d(c1),
+                nn.ReLU(),
+                nn.Conv2d(c1, c2, 1),
+                nn.BatchNorm2d(c2),
+                nn.ReLU(),
+                nn.Conv2d(c2, self.proj_dim, 1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Dropout(p_drop),
             )
 
-        LOGGER.info("CNN encoder  base=%d  proj_dim=%d", base, self.proj_dim)
+        LOGGER.info("CNN encoder base=%d proj_dim=%d", base, self.proj_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.layer_norm(x)
-        return self.backbone(x)           # (B, proj_dim)
-
-
+        return self.backbone(x)
 
 
 class PlugContrastiveCNN(nn.Module):
-    # CNN encoder + small MLP head.  Width scales via target_ratio.
+    """CNN encoder + MLP head tuned for supervised contrastive training."""
+
     def __init__(
         self,
         n_parts: int,
@@ -170,6 +199,12 @@ class PlugContrastiveCNN(nn.Module):
         proj_mult: int = 2,
     ):
         super().__init__()
+        self.n_examples = n_examples
+        self.target_ratio = target_ratio
+        self.p_drop = p_drop
+        self.width_cap = width_cap
+        self.proj_mult = proj_mult
+
         self.n_parts = n_parts
         self.n_layers = n_layers
         self.hidden = hidden
@@ -186,19 +221,24 @@ class PlugContrastiveCNN(nn.Module):
         )
         proj_dim = self.encoder.proj_dim
         self.classifier = nn.Sequential(
-            nn.Linear(proj_dim, proj_dim), nn.ReLU(), nn.Dropout(p_drop),
-            nn.Linear(proj_dim, max(32, proj_dim // 4)), nn.ReLU(), nn.Dropout(p_drop),
+            nn.Linear(proj_dim, proj_dim),
+            nn.ReLU(),
+            nn.Dropout(p_drop),
+            nn.Linear(proj_dim, max(32, proj_dim // 4)),
+            nn.ReLU(),
+            nn.Dropout(p_drop),
             nn.Linear(max(32, proj_dim // 4), num_classes),
         )
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         LOGGER.info(
-            "PlugContrastiveCNN • classes=%d  params=%d (≈%.1f×N)",
-            num_classes, n_params, n_params / (n_examples or 1)
+            "PlugContrastiveCNN • classes=%d params=%d (≈%.1f×N)",
+            num_classes,
+            n_params,
+            n_params / (n_examples or 1),
         )
 
-    # flatten grid -> encode -> logits (+ embedding)
-    def forward(self, flat_x):
+    def forward(self, flat_x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         b = flat_x.size(0)
         if self.n_parts == 1:
             x = flat_x.view(b, self.n_layers, self.hidden)
@@ -209,45 +249,40 @@ class PlugContrastiveCNN(nn.Module):
         return logits, z
 
 
-
-# SUPERVISED CONTRASTIVE LOSS
-
 class SupConLoss(nn.Module):
-    # Supervised Contrastive Loss from Khosla et al. (2020)
+    """Supervised Contrastive Loss (Khosla et al., 2020)."""
+
     def __init__(self, temperature: float = 0.07):
         super().__init__()
         self.tau = temperature
         self.eps = 1e-8
 
-    def forward(self, feats: torch.Tensor, labels: torch.Tensor):
+    def forward(self, feats: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         f = torch.nn.functional.normalize(feats, p=2, dim=1)
-        sim = torch.matmul(f, f.T) / self.tau
-        mask = torch.eq(labels.view(-1, 1), labels.view(1, -1)).float()
-        logits_mask = torch.ones_like(mask) - torch.eye(mask.size(0), device=mask.device)
-        sim = sim * logits_mask
-        exp = torch.exp(sim) * logits_mask
+        sim = (f @ f.T) / self.tau
+        mask = (labels[:, None] == labels[None, :]).float()
+        sim = sim * (1 - torch.eye(mask.size(0), device=mask.device))
+        exp = torch.exp(sim) * (1 - torch.eye(mask.size(0), device=mask.device))
         log_prob = sim - torch.log(exp.sum(1, keepdim=True) + self.eps)
-        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + self.eps)
-        return -mean_log_prob_pos.mean()
+        mean_log_prob = (mask * log_prob).sum(1) / (mask.sum(1) + self.eps)
+        return -mean_log_prob.mean()
 
 
-# I/O UTILITIES
+# I/O utilities
 
 def load_npz_features(npz_path: str) -> Tuple[pd.DataFrame, dict]:
-    # Load features saved as .npz and return DataFrame + meta.
     with np.load(npz_path, allow_pickle=True) as npz:
-        data   = npz["data"]          # (feat, samples)
-        ids    = npz["columns"]
-        parts  = list(npz["parts"])
+        data = npz["data"]
+        ids = npz["columns"]
+        parts = list(npz["parts"])
         layers = list(npz["layers"])
         hidden = int(npz["hidden_size"][0])
-    df   = pd.DataFrame(data.T, index=ids)
+    df = pd.DataFrame(data.T, index=ids)
     meta = {"parts": parts, "layers": layers, "hidden_size": hidden}
     return df, meta
 
 
 def _to_numpy(X: Union[pd.DataFrame, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-    # Convert DataFrame/array to (float32 np.ndarray, id_array)
     if isinstance(X, pd.DataFrame):
         return X.values.astype(np.float32), X.index.to_numpy()
     return X.astype(np.float32), np.arange(X.shape[0])
@@ -279,44 +314,28 @@ def _make_model(
             len(meta["layers"]),
             meta["hidden_size"],
             num_classes=num_classes,
-            n_examples=n_examples,          # <‑‑ now forwarded
-            target_ratio=target_ratio,      # <‑‑ now forwarded
+            n_examples=n_examples,
+            target_ratio=target_ratio,
             p_drop=p_drop,
         )
     raise ValueError(f"Unknown model_type {model_type!r}")
 
 
-
-
-
-def _forward(
-    model: nn.Module,
-    xb: torch.Tensor,
-    model_type: str
-) -> Tuple[torch.Tensor, torch.Tensor | None]:
-    # Forward helper that always returns (probabilities, embedding_or_None)
-    if model_type == "cnn":
-        logits, z = model(xb)
+def _forward(model: nn.Module, xb: torch.Tensor, model_type: str) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    """Run model and normalise its output to (logits, embedding_opt)."""
+    out = model(xb)
+    if isinstance(out, tuple):
+        logits, *extras = out
+        z = extras[0] if extras else None
     else:
-        logits = model(xb)
+        logits = out
         z = None
-    probs = torch.softmax(logits, dim=1)
-    return probs, z
+    return logits, z
 
 
 def _path_prefix(path: str) -> str:
-    # Strip weight‑file extension to obtain the base prefix.
     root, ext = os.path.splitext(path)
     return root if ext.lower() in {".pt", ".pth", ".bin"} else path
-
-
-def _json_default(obj):
-    # Make numpy scalars / arrays JSON‑serialisable.
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    raise TypeError(f"{type(obj)} cannot be JSON‑encoded")
 
 
 def save_artifacts(
@@ -325,11 +344,10 @@ def save_artifacts(
     path: str = "artifacts/plug",
     meta: dict | None = None,
 ) -> Tuple[str, str]:
-    # Save model weights + meta and return absolute file paths.
+    """Serialise weights (.pt) + mini‑meta (.json)."""
     prefix = _path_prefix(path)
     os.makedirs(os.path.dirname(prefix) or ".", exist_ok=True)
 
-    # Detect model type and number of classes
     if isinstance(model, PlugClassifier):
         mtype = "mlp"
         num_classes = model.out[-1].out_features
@@ -340,74 +358,85 @@ def save_artifacts(
         raise TypeError(f"Unsupported model class {type(model)}")
 
     meta_out: dict = {"model_type": mtype, "num_classes": num_classes}
-    if meta:
-        meta_out.update(meta)
 
     if mtype == "mlp":
-        meta_out.setdefault("input_dim", int(model.fc1[0].in_features))
+        meta_out["input_dim"] = int(model.fc1[0].in_features)
     else:
-        meta_out.setdefault("parts",       model.n_parts)
-        meta_out.setdefault("layers",      model.n_layers)
-        meta_out.setdefault("hidden_size", model.hidden)
+        meta_out["parts"] = model.n_parts
+        meta_out["layers"] = model.n_layers
+        meta_out["hidden_size"] = model.hidden
+
+    meta_out["n_examples"] = getattr(model, "n_examples", None)
+    meta_out["target_ratio"] = getattr(model, "target_ratio", 5.0)
+    meta_out["p_drop"] = getattr(model, "p_drop", 0.3)
+    meta_out["width_cap"] = getattr(model, "width_cap", 64)
+    if mtype == "cnn":
+        meta_out["proj_mult"] = getattr(model, "proj_mult", 2)
+
+    if meta:
+        meta_out.update(meta)
 
     weights_path = prefix + ".pt"
     torch.save(model.state_dict(), weights_path)
 
     meta_path = prefix + ".json"
     with open(meta_path, "w") as fp:
-        json.dump(meta_out, fp, indent=2, default=_json_default)
+        json.dump(meta_out, fp, indent=2, default=_json_encode)
 
-    LOGGER.info("Artifacts saved → %s  (+ meta %s)", weights_path, meta_path)
+    LOGGER.info("Artifacts saved → %s (+ meta %s)", weights_path, meta_path)
     return os.path.abspath(weights_path), os.path.abspath(meta_path)
 
 
 def _build_from_meta(meta: dict, device: Union[str, torch.device] = "cpu") -> torch.nn.Module:
-    # Recreate uninitialised model from stored metadata.
+    """Rebuild a model skeleton identical to the one that produced `meta`."""
     num_classes = int(meta.get("num_classes", 2))
+    common_kwargs = dict(
+        n_examples=meta.get("n_examples"),
+        target_ratio=meta.get("target_ratio", 5.0),
+        p_drop=meta.get("p_drop", 0.3),
+        width_cap=meta.get("width_cap", 64),
+    )
+
     mtype = meta.get("model_type", "mlp")
     if mtype == "mlp":
-        return PlugClassifier(int(meta["input_dim"]), num_classes).to(device)
-    if mtype == "cnn":
-        return _make_model(
-            "cnn", input_dim=-1, meta=meta,
-            num_classes=num_classes
-        ).to(device)
-    raise ValueError(f"Unknown model_type {mtype!r}")
+        model = PlugClassifier(int(meta["input_dim"]), num_classes, **common_kwargs)
+    elif mtype == "cnn":
+        model = PlugContrastiveCNN(
+            len(meta["parts"]),
+            len(meta["layers"]),
+            meta["hidden_size"],
+            num_classes=num_classes,
+            proj_mult=meta.get("proj_mult", 2),
+            **common_kwargs,
+        )
+    else:
+        raise ValueError(f"Unknown model_type {mtype!r}")
+
+    return model.to(device)
 
 
-def load_artifacts(
-    path: str,
-    *,
-    device: str | torch.device = "cpu",
-) -> Tuple[torch.nn.Module, dict]:
-    # Load model weights + meta (generated by save_artifacts).
+def load_artifacts(path: str, *, device: str | torch.device = "cpu") -> Tuple[torch.nn.Module, dict]:
     prefix = _path_prefix(path)
-    weights_path = None
-    for ext in (".pt", ".pth"):
-        cand = prefix + ext
-        if os.path.isfile(cand):
-            weights_path = cand
-            break
+
+    weights_path = next((prefix + ext for ext in (".pt", ".pth") if os.path.isfile(prefix + ext)), None)
     if weights_path is None:
         raise FileNotFoundError(f"No weight file (.pt or .pth) for prefix '{prefix}'.")
 
     meta_path = prefix + ".json"
-    if os.path.isfile(meta_path):
-        with open(meta_path) as fp:
-            meta = json.load(fp)
-    else:
+    if not os.path.isfile(meta_path):
         raise FileNotFoundError("meta.json missing; cannot rebuild model.")
+    with open(meta_path) as fp:
+        meta = json.load(fp)
 
-    device = torch.device(device)
+    device = _select_device(device)
     model = _build_from_meta(meta, device)
     model.load_state_dict(torch.load(weights_path, map_location=device))
     model.eval()
-    LOGGER.info("Loaded model ← %s  (device=%s)", weights_path, device)
+    LOGGER.info("Loaded model ← %s (device=%s)", weights_path, device)
     return model, meta
 
 
 def _read_features(src: Union[str, pd.DataFrame, np.ndarray]) -> Tuple[pd.DataFrame, dict | None]:
-    # Convenience loader that accepts DataFrame, ndarray, .csv, or .npz
     if isinstance(src, pd.DataFrame):
         return src, None
     if isinstance(src, np.ndarray):
@@ -419,7 +448,231 @@ def _read_features(src: Union[str, pd.DataFrame, np.ndarray]) -> Tuple[pd.DataFr
     raise TypeError(type(src))
 
 
-# CROSS‑VALIDATION LOOP
+MetricFn = Callable[[np.ndarray, np.ndarray], float]
+
+
+def _macro_roc_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    if y_prob.ndim == 1 or y_prob.shape[1] == 1:
+        return roc_auc_score(y_true, y_prob.ravel())
+    return roc_auc_score(y_true, y_prob, multi_class="ovr", average="macro")
+
+
+_METRIC_REGISTRY: dict[str, Tuple[MetricFn, str]] = {
+    "roc_auc": (_macro_roc_auc, "max"),
+    "accuracy": (lambda y, p: accuracy_score(y, p.argmax(1)), "max"),
+    "macro_f1": (lambda y, p: f1_score(y, p.argmax(1), average="macro"), "max"),
+}
+
+
+def _ensure_metric(metric: str | MetricFn) -> Tuple[MetricFn, str]:
+    if callable(metric):
+        return metric, "max"
+    if metric not in _METRIC_REGISTRY:
+        raise ValueError(f"Unknown metric {metric!r}")
+    return _METRIC_REGISTRY[metric]
+
+
+@dataclass
+class EarlyStopping:
+    """Stop training when the monitored metric has not improved after `patience` epochs."""
+    patience: int = 10
+    min_delta: float = 0.0
+    mode: str = "max"
+
+    best: float | None = None
+    bad_epochs: int = 0
+
+    def step(self, score: float) -> bool:
+        if self.best is None:
+            self.best = score
+            return False
+        improve = (score - self.best) if self.mode == "max" else (self.best - score)
+        if improve > self.min_delta:
+            self.best = score
+            self.bad_epochs = 0
+        else:
+            self.bad_epochs += 1
+        return self.bad_epochs > self.patience
+
+
+def _train_one_epoch(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    *,
+    model_type: str,
+    opt: torch.optim.Optimizer,
+    ce_loss: nn.CrossEntropyLoss,
+    supcon: SupConLoss | None,
+    contrastive_weight: float,
+    device: torch.device,
+) -> float:
+    model.train()
+    running = 0.0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        opt.zero_grad(set_to_none=True)
+
+        if model_type == "cnn":
+            logits, z = model(xb)
+            loss = ce_loss(logits, yb) + contrastive_weight * supcon(z, yb)
+        else:
+            logits = model(xb)
+            loss = ce_loss(logits, yb)
+
+        loss.backward()
+        opt.step()
+        running += loss.item() * xb.size(0)
+
+    return running / len(loader.dataset)
+
+
+@torch.no_grad()
+def _evaluate(
+    model: nn.Module,
+    X: np.ndarray,
+    y_true: np.ndarray,
+    *,
+    model_type: str,
+    metric_fn: MetricFn | None,
+    ce_loss: nn.CrossEntropyLoss | None,
+    device: torch.device,
+    batch_size: int = 4096,
+) -> Tuple[np.ndarray, float, float | None]:
+    was_training = model.training
+    model.eval()
+
+    n = len(X)
+    prob_chunks: list[torch.Tensor] = []
+    running_ce = 0.0
+
+    try:
+        for i in range(0, n, batch_size):
+            xb = torch.tensor(X[i : i + batch_size], device=device)
+            yb = torch.tensor(y_true[i : i + batch_size], device=device)
+
+            logits_b, _ = _forward(model, xb, model_type)
+            probs_b = torch.softmax(logits_b, dim=1)
+            prob_chunks.append(probs_b.cpu())
+
+            if ce_loss is not None:
+                running_ce += ce_loss(logits_b, yb).item() * len(yb)
+
+        probs = torch.cat(prob_chunks, 0).numpy()
+        score = math.nan if metric_fn is None else metric_fn(y_true, probs)
+        loss_val = None if ce_loss is None else running_ce / n
+        return probs, score, loss_val
+    finally:
+        if was_training:
+            model.train()
+
+
+def _make_validation_split(
+    y: np.ndarray, *, val_fraction: float, random_state: int | None = 101
+) -> Tuple[np.ndarray, np.ndarray]:
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError("val_fraction must be in (0, 1).")
+    splitter = StratifiedShuffleSplit(
+        n_splits=1, test_size=val_fraction, random_state=random_state
+    )
+    tr_idx, va_idx = next(splitter.split(np.zeros_like(y), y))
+    return tr_idx, va_idx
+
+
+# fit
+
+def fit(
+    X: Union[pd.DataFrame, np.ndarray],
+    y: Union[pd.Series, np.ndarray],
+    *,
+    model_type: str = "mlp",
+    meta: dict | None = None,
+    num_classes: int = 2,
+    n_epochs: int = 300,
+    learning_rate: float = 1e-3,
+    batch_size: int = 256,
+    device: str | torch.device = "cuda",
+    contrastive_weight: float = 1.0,
+    validation_data: Tuple[Union[pd.DataFrame, np.ndarray], np.ndarray] | None = None,
+    val_split: float | None = None,
+    metric: str | MetricFn = "roc_auc",
+    early_stopping: bool = True,
+    patience: int = 10,
+    random_state: int | None = 101,
+) -> Tuple[nn.Module, list[dict]]:
+    device = _select_device(device)
+    X_np, _ = _to_numpy(X)
+    y_np = np.asarray(y, dtype=int)
+
+    # validation handling
+    if validation_data is not None:
+        X_val_np, _ = _to_numpy(validation_data[0])
+        y_val_np = np.asarray(validation_data[1], dtype=int)
+    elif val_split:
+        tr_idx, va_idx = _make_validation_split(y_np, val_fraction=val_split, random_state=random_state)
+        X_val_np, y_val_np = X_np[va_idx], y_np[va_idx]
+        X_np, y_np = X_np[tr_idx], y_np[tr_idx]
+    else:
+        X_val_np = y_val_np = None
+        early_stopping = False
+
+    metric_fn, metric_mode = _ensure_metric(metric)
+    if metric == "loss":
+        metric_fn = None
+        metric_mode = "min"
+
+    model = _make_model(
+        model_type,
+        input_dim=X_np.shape[1],
+        meta=meta,
+        num_classes=num_classes,
+        n_examples=len(X_np),
+    ).to(device)
+    opt = optim.Adam(model.parameters(), lr=learning_rate)
+    ce_loss = nn.CrossEntropyLoss()
+    supcon = SupConLoss().to(device) if model_type == "cnn" else None
+
+    ds = torch.utils.data.TensorDataset(torch.tensor(X_np), torch.tensor(y_np, dtype=torch.long))
+    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+    stopper = EarlyStopping(patience=patience, mode=metric_mode)
+    history: list[dict] = []
+
+    for ep in tqdm(range(1, n_epochs + 1), desc="Fit", ncols=80):
+        tr_loss = _train_one_epoch(
+            model,
+            loader,
+            model_type=model_type,
+            opt=opt,
+            ce_loss=ce_loss,
+            supcon=supcon,
+            contrastive_weight=contrastive_weight,
+            device=device,
+        )
+
+        val_metric = math.nan
+        if X_val_np is not None:
+            _, val_metric, _ = _evaluate(
+                model,
+                X_val_np,
+                y_val_np,
+                model_type=model_type,
+                metric_fn=(metric_fn or _macro_roc_auc),
+                ce_loss=ce_loss if metric == "loss" else None,
+                device=device,
+            )
+
+        history.append({"epoch": ep, "train_loss": tr_loss, "val_metric": val_metric})
+
+        if early_stopping and X_val_np is not None and stopper.step(val_metric):
+            LOGGER.info("Early stopping at epoch %d (best=%.4f)", ep, stopper.best)
+            break
+
+    model.eval()
+    return model, history
+
+
+# cross‑validation
+
 
 def cross_validate(
     X: Union[pd.DataFrame, np.ndarray],
@@ -429,28 +682,28 @@ def cross_validate(
     meta: dict | None = None,
     num_classes: int = 2,
     label_col: str | None = None,
-    leave_out_col: str | None = None,
+    splitter: Iterable[Tuple[np.ndarray, np.ndarray]] | None = None,
+    n_splits: int = 5,
     groups: Union[pd.Series, np.ndarray, None] = None,
+    inner_val_split: float | None = 0.15,
     n_epochs: int = 100,
     learning_rate: float = 1e-3,
-    n_splits: int = 5,
     batch_size: int = 128,
     device: str | torch.device = "cuda",
-    eval_every: int = 1,
     contrastive_weight: float = 1.0,
+    metric: str | MetricFn = "roc_auc",
+    early_stopping: bool = True,
+    patience: int = 10,
+    random_state: int | None = 101,
+    eval_every: int = 1,
     out_dir: str = "artifacts",
     run_name: str | None = None,
-    early_stopping: bool = False,
-    patience: int = 10,
-) -> np.ndarray:
-    # Cross‑validate multi‑class models.  Returns per‑sample probability matrix.
-    from datetime import datetime
+) -> Tuple[np.ndarray, dict]:
     if run_name is None:
         run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
     full_out_dir = os.path.join(out_dir, run_name)
     os.makedirs(full_out_dir, exist_ok=True)
 
-    # Labels to ndarray (int class indices)
     if isinstance(y, pd.DataFrame):
         if label_col is None:
             raise ValueError("label_col required when y is a DataFrame.")
@@ -460,258 +713,178 @@ def cross_validate(
     else:
         y_vec = np.asarray(y, dtype=int)
 
-    # Group splitting if requested
-    if groups is None and leave_out_col is not None:
-        if isinstance(X, pd.DataFrame) and leave_out_col in X.columns:
-            groups = X[leave_out_col]
-        elif isinstance(y, pd.DataFrame) and leave_out_col in y.columns:
-            groups = y[leave_out_col]
+    if splitter is None:
+        if groups is not None:
+            splitter = LeaveOneGroupOut().split(X, y_vec, groups)
+            n_splits = len(np.unique(groups))
         else:
-            raise KeyError(f"{leave_out_col!r} not found in X nor y.")
-    if groups is not None:
-        groups = np.asarray(groups)
-        splitter = LeaveOneGroupOut()
-        split_gen = splitter.split(X, y_vec, groups)
-        n_splits = len(np.unique(groups))
-        mode = f"LOGO ({n_splits} groups)"
-    else:
-        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=101)
-        split_gen = splitter.split(X, y_vec)
-        mode = f"{n_splits}-fold stratified"
+            splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state).split(X, y_vec)
+    split_gen = list(splitter)
 
-    LOGGER.info(
-        "CV • %s • model=%s • classes=%d • epochs=%d • run=%s",
-        mode, model_type, num_classes, n_epochs, run_name
-    )
-
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    device = _select_device(device)
     X_np, _ = _to_numpy(X)
-
     ce_loss = nn.CrossEntropyLoss()
-    supcon = SupConLoss().to(device)
+
+    if metric == "loss":
+        metric_fn = None
+        metric_mode = "min"
+        metric_name = "loss"
+    else:
+        metric_fn, metric_mode = _ensure_metric(metric)
+        metric_name = metric if isinstance(metric, str) else metric_fn.__name__
+
+    supcon = SupConLoss().to(device) if model_type == "cnn" else None
 
     preds = np.zeros((len(y_vec), num_classes), np.float32)
-    all_epochs: list[list[int]] = []
-    all_metrics: list[list[float]] = []
-    summary: list[dict] = []
-    cv_start = time.time()
+    curve_data, fold_stats = [], []
+    t0 = time.time()
 
-    for fold, (tr, va) in enumerate(split_gen, 1):
-        grp_name = np.unique(groups[va])[0] if groups is not None else "N/A"
-        LOGGER.info("Fold %d/%d (group=%s) – training …", fold, n_splits, grp_name)
+    for fold, (tr, te) in enumerate(split_gen, 1):
+        LOGGER.info("Fold %d/%d - training …", fold, len(split_gen))
+
+        if inner_val_split and inner_val_split > 0.0:
+            tr_idx, va_idx = _make_validation_split(
+                y_vec[tr], val_fraction=inner_val_split, random_state=random_state
+            )
+            tr_inner, va_inner = tr[tr_idx], tr[va_idx]
+        else:
+            tr_inner, va_inner = tr, None
+
+        fold_early_stop = early_stopping and (va_inner is not None)
+
+        ds = torch.utils.data.TensorDataset(
+            torch.tensor(X_np[tr_inner]),
+            torch.tensor(y_vec[tr_inner], dtype=torch.long),
+        )
+        loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
 
         model = _make_model(
             model_type,
             input_dim=X_np.shape[1],
             meta=meta,
             num_classes=num_classes,
-            n_examples=len(tr),               # <‑‑ add this
+            n_examples=len(tr_inner),
         ).to(device)
-
         opt = optim.Adam(model.parameters(), lr=learning_rate)
-        ds = torch.utils.data.TensorDataset(
-            torch.tensor(X_np[tr]), torch.tensor(y_vec[tr], dtype=torch.long)
-        )
-        loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+        stopper = EarlyStopping(patience=patience, mode=metric_mode)
 
-        epochs_checked: list[int] = []
-        metric_hist: list[float] = []
-        best_metric = -float("inf")
-        epochs_no_imp = 0
+        epochs_seen, metrics_seen = [], []
 
         for ep in range(1, n_epochs + 1):
-            model.train()
-            running_loss = 0.0
-            for xb, yb in loader:
-                xb, yb = xb.to(device), yb.to(device)
-                opt.zero_grad(set_to_none=True)
+            _train_one_epoch(
+                model,
+                loader,
+                model_type=model_type,
+                opt=opt,
+                ce_loss=ce_loss,
+                supcon=supcon,
+                contrastive_weight=contrastive_weight,
+                device=device,
+            )
 
-                # forward and loss
-                if model_type == "cnn":
-                    logits, z = model(xb)
-                    cls_loss = ce_loss(logits, yb)
-                    loss = cls_loss + contrastive_weight * supcon(z, yb)
-                else:
-                    logits = model(xb)
-                    loss = ce_loss(logits, yb)
-
-                loss.backward()
-                opt.step()
-                running_loss += loss.item() * xb.size(0)
-
-            # periodic evaluation
             if ep % eval_every == 0 or ep == n_epochs:
-                model.eval()
-                with torch.no_grad():
-                    p_val, _ = _forward(
+                val_metric = math.nan
+                if va_inner is not None:
+                    _, s_val, l_val = _evaluate(
                         model,
-                        torch.tensor(X_np[va]).to(device),
-                        model_type
+                        X_np[va_inner],
+                        y_vec[va_inner],
+                        model_type=model_type,
+                        metric_fn=None if metric == "loss" else metric_fn,
+                        ce_loss=ce_loss,
+                        device=device,
                     )
-                    p_tr, _ = _forward(
-                        model,
-                        torch.tensor(X_np[tr]).to(device),
-                        model_type
+                    val_metric = l_val if metric == "loss" else s_val
+
+                _, s_tr, l_tr = _evaluate(
+                    model,
+                    X_np[tr_inner],
+                    y_vec[tr_inner],
+                    model_type=model_type,
+                    metric_fn=None if metric == "loss" else metric_fn,
+                    ce_loss=ce_loss,
+                    device=device,
+                )
+                train_metric = l_tr if metric == "loss" else s_tr
+
+                LOGGER.info(
+                    "Fold %d ep %3d | train_%s %.4f val_%s %.4f",
+                    fold,
+                    ep,
+                    metric_name,
+                    train_metric,
+                    metric_name,
+                    val_metric,
+                )
+
+                epochs_seen.append(ep)
+                metrics_seen.append(val_metric)
+
+                if fold_early_stop and stopper.step(val_metric):
+                    LOGGER.info(
+                        "Fold %d - early stop at epoch %d (best=%.4f)", fold, ep, stopper.best
                     )
-
-                v = p_val.cpu().numpy()
-                t = p_tr.cpu().numpy()
-
-                # Macro ROC‑AUC over classes
-                if num_classes == 2:
-                    # binary → use the positive‑class probability
-                    val_auc = roc_auc_score(y_vec[va], v[:, 1])
-                    tr_auc  = roc_auc_score(y_vec[tr], t[:, 1])
-                else:
-                    # multi‑class → macro One‑Vs‑Rest
-                    val_auc = roc_auc_score(y_vec[va], v, multi_class="ovr", average="macro")
-                    tr_auc  = roc_auc_score(y_vec[tr], t, multi_class="ovr", average="macro")
-                LOGGER.info("Fold %d ep %3d | train_auc %.4f val_auc %.4f",
-                            fold, ep, tr_auc, val_auc)
-
-                epochs_checked.append(ep)
-                metric_hist.append(val_auc)
-                p_val_final = v
-
-                # early stopping logic
-                if early_stopping:
-                    if val_auc > best_metric:
-                        best_metric = val_auc
-                        epochs_no_imp = 0
-                    else:
-                        epochs_no_imp += 1
-                        if epochs_no_imp >= patience:
-                            LOGGER.info("Early stopping after %d epochs", patience)
-                            break
-
-        preds[va] = p_val_final
-        all_epochs.append(epochs_checked)
-        all_metrics.append(metric_hist)
-        summary.append({
-            "fold": fold,
-            "group": str(grp_name),
-            "final_auc": metric_hist[-1],
-            "epoch_final": epochs_checked[-1]
-        })
-        LOGGER.info("Fold %d done – final_auc %.4f @ epoch %d",
-                    fold, metric_hist[-1], epochs_checked[-1])
-
-    # Plot ROC‑AUC curves
-    plt.figure()
-    min_v = min(min(m) for m in all_metrics)
-    for f, (eps, mets) in enumerate(zip(all_epochs, all_metrics), 1):
-        plt.scatter(eps, mets, s=15, alpha=0.3)
-        plt.plot(eps, pd.Series(mets).rolling(3, min_periods=1).mean(),
-                 label=f"fold {f}")
-    plt.ylabel("Macro ROC‑AUC")
-    plt.ylim(min_v - 0.05, 1.0)
-    plt.xlabel("epoch")
-    plt.title("Cross‑validation ROC‑AUC")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    png_path = os.path.join(full_out_dir, "cv_curves.png")
-    plt.savefig(png_path, dpi=120)
-    plt.close()
-
-    # Summary JSON
-    elapsed = time.time() - cv_start
-    if num_classes == 2:
-        overall_auc = roc_auc_score(y_vec, preds[:, 1])
-    else:
-        overall_auc = roc_auc_score(
-            y_vec, preds, multi_class="ovr", average="macro"
-        )
-    LOGGER.info("CV done – overall macro AUC %.4f | %.1fs", overall_auc, elapsed)
-    summary_dict = {
-        "overall_auc": overall_auc,
-        "sec_total": elapsed,
-        "folds": summary,
-        "curves_png": os.path.basename(png_path)
-    }
-    with open(os.path.join(full_out_dir, "cv_summary.json"), "w") as fp:
-        json.dump(summary_dict, fp, indent=2)
-
-    return preds
-
-
-# FULL‑DATA TRAINING
-
-
-def fit(
-    X: Union[pd.DataFrame, np.ndarray],
-    y: np.ndarray,
-    *,
-    model_type: str = "mlp",
-    meta: dict | None = None,
-    num_classes: int = 2,
-    n_epochs: int = 300,
-    learning_rate: float = 1e-3,
-    batch_size: int = 256,
-    device: str = "cuda",
-    contrastive_weight: float = 1.0,
-    early_stopping: bool = False,
-    patience: int = 10
-):
-    # Train on full dataset and return the fitted model.
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    X_np, _ = _to_numpy(X)
-    y_np = np.asarray(y, dtype=int)
-
-    model = _make_model(
-        model_type,
-        input_dim=X_np.shape[1],
-        meta=meta,
-        num_classes=num_classes,
-        n_examples=X_np.shape[0],         # <‑‑ add this
-    ).to(device)
-
-    opt = optim.Adam(model.parameters(), lr=learning_rate)
-    supcon = SupConLoss().to(device)
-    ce_loss = nn.CrossEntropyLoss()
-
-    ds = torch.utils.data.TensorDataset(
-        torch.tensor(X_np), torch.tensor(y_np, dtype=torch.long)
-    )
-    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
-
-    best_loss = float("inf")
-    no_imp = 0
-
-    for ep in tqdm(range(n_epochs), desc="Full‑fit", ncols=80):
-        model.train()
-        total_loss = 0.0
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad(set_to_none=True)
-
-            if model_type == "cnn":
-                logits, z = model(xb)
-                loss = ce_loss(logits, yb) + contrastive_weight * supcon(z, yb)
-            else:
-                logits = model(xb)
-                loss = ce_loss(logits, yb)
-
-            loss.backward()
-            opt.step()
-            total_loss += loss.item() * xb.size(0)
-
-        avg_loss = total_loss / len(ds)
-        if early_stopping:
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                no_imp = 0
-            else:
-                no_imp += 1
-                if no_imp >= patience:
-                    LOGGER.info("Early stopping after %d epochs", patience)
                     break
 
-    model.eval()
-    return model
+        y_prob_test, s_test, l_test = _evaluate(
+            model,
+            X_np[te],
+            y_vec[te],
+            model_type=model_type,
+            metric_fn=None if metric == "loss" else metric_fn,
+            ce_loss=ce_loss,
+            device=device,
+        )
+        fold_metric_val = l_test if metric == "loss" else s_test
+        preds[te] = y_prob_test
+
+        curve_data.append({"fold": fold, "epochs": epochs_seen, "metrics": metrics_seen})
+        fold_stats.append({"fold": fold, "metric": fold_metric_val, "epochs_total": epochs_seen[-1]})
+
+        LOGGER.info("Fold %d finished - %s %.4f", fold, metric_name, fold_metric_val)
+
+    if metric == "loss":
+        overall_metric = ce_loss(torch.tensor(preds), torch.tensor(y_vec)).item()
+    else:
+        overall_metric = metric_fn(y_vec, preds)
+
+    elapsed = time.time() - t0
+    cv_summary = {
+        "overall_metric": overall_metric,
+        "metric_name": metric_name,
+        "metric_mode": metric_mode,
+        "sec_total": elapsed,
+        "folds": fold_stats,
+    }
+
+    if curve_data and any(cd["metrics"] for cd in curve_data):
+        plt.figure()
+        vmin = min(min(cd["metrics"]) for cd in curve_data if cd["metrics"])
+        for cd in curve_data:
+            plt.scatter(cd["epochs"], cd["metrics"], s=12, alpha=0.4)
+            plt.plot(cd["epochs"], pd.Series(cd["metrics"]).rolling(3, min_periods=1).mean(), label=f"fold {cd['fold']}")
+        plt.ylabel(metric_name)
+        if metric_mode == "max":
+            plt.ylim(vmin - 0.05, 1.0)
+        plt.xlabel("epoch")
+        plt.title("Cross‑validation learning curves")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+
+        png_path = os.path.join(full_out_dir, "cv_curves.png")
+        plt.savefig(png_path, dpi=120)
+        plt.close()
+        cv_summary["curves_png"] = os.path.basename(png_path)
+
+    with open(os.path.join(full_out_dir, "cv_summary.json"), "w") as fp:
+        json.dump(cv_summary, fp, indent=2)
+
+    LOGGER.info("CV done - overall %.4f | %.1fs", overall_metric, elapsed)
+    return preds, cv_summary
 
 
-# PREDICTION + OPTIONAL EVALUATION
+# prediction
 
 def predict(
     features: Union[str, pd.DataFrame, np.ndarray],
@@ -721,72 +894,61 @@ def predict(
     response_csv: str | None = None,
     response_col: str = "answer",
     device: str = "cuda",
+    batch_size: int = 4096,
 ) -> pd.DataFrame:
-    # 1.  Load feature matrix (csv / npz / ndarray / DataFrame)
     X_df, _ = _read_features(features)
     ids = X_df.index.to_numpy()
     X_np = X_df.values.astype(np.float32)
 
-    # 2.  Re‑instantiate model from saved artefacts
     model, meta = load_artifacts(model_path, device=device)
-    model_type  = meta.get("model_type", "mlp")
+    model_type = meta.get("model_type", "mlp")
     num_classes = int(meta.get("num_classes", 2))
 
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    with torch.no_grad():
-        probs_tensor, _ = _forward(
-            model,
-            torch.tensor(X_np, device=device),
-            model_type,
-        )
-    probs = probs_tensor.cpu().numpy()        # (N, C) soft‑max probs
+    device = _select_device(device)
+    prob_chunks: list[torch.Tensor] = []
 
-    # 3.  Build prediction DataFrame
+    with torch.no_grad():
+        for i in range(0, len(X_np), batch_size):
+            xb = torch.tensor(X_np[i : i + batch_size], device=device)
+            logits_b, _ = _forward(model, xb, model_type)
+            probs_b = torch.softmax(logits_b, dim=1)
+            prob_chunks.append(probs_b.cpu())
+
+    probs = torch.cat(prob_chunks, 0).numpy()
+
     if num_classes == 2:
-        # Binary → store only the positive‑class probability for convenience
-        pred_df = pd.DataFrame(
-            {"id": ids, "prob_positive": probs[:, 1]},
-            columns=["id", "prob_positive"],
-        )
+        pred_df = pd.DataFrame({"id": ids, "prob_positive": probs[:, 1]}, columns=["id", "prob_positive"])
     else:
-        # Multi‑class → one probability column per class
         pred_cols = {f"prob_class_{c}": probs[:, c] for c in range(num_classes)}
         pred_df = pd.DataFrame({"id": ids, **pred_cols})
 
     pred_df.to_csv(output_csv, index=False)
     LOGGER.info("Predictions → %s", output_csv)
 
-    # 4.  Optional evaluation against ground‑truth CSV
     if response_csv is not None:
-        gt_df  = pd.read_csv(response_csv, index_col="id")
+        gt_df = pd.read_csv(response_csv, index_col="id")
         merged = gt_df[[response_col]].join(pred_df.set_index("id"), how="inner")
         if merged.empty:
-            LOGGER.warning("No overlapping IDs with ground‑truth; metrics skipped.")
+            LOGGER.warning("No overlapping IDs with ground truth; metrics skipped.")
         else:
             y_true = merged[response_col].values.astype(int)
-
             if num_classes == 2:
-                # Binary metrics
                 y_pred_prob = merged["prob_positive"].values
-                y_pred_cls  = (y_pred_prob >= 0.5).astype(int)
+                y_pred_cls = (y_pred_prob >= 0.5).astype(int)
                 auc = roc_auc_score(y_true, y_pred_prob)
             else:
-                # Multi‑class metrics
-                prob_cols   = [f"prob_class_{c}" for c in range(num_classes)]
+                prob_cols = [f"prob_class_{c}" for c in range(num_classes)]
                 y_pred_prob = merged[prob_cols].values
-                y_pred_cls  = y_pred_prob.argmax(1)
-                auc = roc_auc_score(
-                    y_true, y_pred_prob, multi_class="ovr", average="macro"
-                )
+                y_pred_cls = y_pred_prob.argmax(1)
+                auc = roc_auc_score(y_true, y_pred_prob, multi_class="ovr", average="macro")
 
             metrics = {
-                "accuracy":  accuracy_score(y_true, y_pred_cls),
-                "macro_f1":  f1_score(y_true, y_pred_cls, average="macro"),
-                "auc":       auc,
+                "accuracy": accuracy_score(y_true, y_pred_cls),
+                "macro_f1": f1_score(y_true, y_pred_cls, average="macro"),
+                "auc": auc,
                 "precision_macro": precision_score(y_true, y_pred_cls, average="macro"),
-                "recall_macro":    recall_score(y_true, y_pred_cls, average="macro"),
+                "recall_macro": recall_score(y_true, y_pred_cls, average="macro"),
             }
-
             mpath = Path(output_csv).with_suffix(".metrics.json")
             with open(mpath, "w") as fp:
                 json.dump(metrics, fp, indent=2)

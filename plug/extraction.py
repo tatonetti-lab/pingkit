@@ -80,7 +80,7 @@ def extract_token_vectors(
     )
     data: Dict[str, np.ndarray] = dict(results)
 
-    # each col is a sample id, row‑index is feature
+    # each col is a sample id, row-index is feature
     feature_count = hidden_size * len(parts) * len(layers)
     df = pd.DataFrame(data, index=range(feature_count), dtype=np.float32)
 
@@ -98,7 +98,7 @@ def extract_token_vectors(
     np.savez_compressed(
         output_file,
         data=df.values.astype(np.float32),
-        columns=df.columns.values,             # sample IDs
+        columns=df.columns.values,
         parts=np.asarray(parts),
         layers=np.asarray(layers, dtype=np.int16),
         hidden_size=np.asarray([hidden_size], dtype=np.int16),
@@ -116,8 +116,8 @@ def extract_token_vectors(
 if __name__ == "__main__":
     extract_token_vectors(
         "embeddings",
-        parts=("rs", "mlp"),
-        layers=[0, 1, 7],
+        parts=("rs", "mlp", "attn"),
+        layers=[20],
         output_file="embeddings/features_hidden_mlp_L00-01-07.npz",
         save_csv=True,
     )
