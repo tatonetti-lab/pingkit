@@ -3,34 +3,39 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/downloads/)
 
-Pattern Learning for Understanding Generation, or **Plug**, is a Python package designed to simplify modeling using transformer-based embeddings. It provides optimized utilities for capturing last-token activations from HuggingFace AutoModels, aggregating embeddings into structured datasets, and training robust neural network models.
+Pattern Learning for Understanding Generation, or **Plug**, is a Python package that streamlines the journey from transformer activations to reproducible, capacity‑aware models. It includes utilities for
+
+* extracting last‑token embeddings from any 🤗 HuggingFace `AutoModel*`,
+* aggregating those embeddings into tidy feature matrices or compact `.npz` tensors, and
+* training two neural architectures whose **size is chosen automatically from a simple data‑driven heuristic**.
 
 ---
 
 ## Features
 
-- **Efficient Embedding Extraction**: Capture last-token embeddings from transformer models (e.g., Gemma, GPT-2, etc.).
-- **Flexible Aggregation**: Easily aggregate embeddings across layers and model components (attention, MLP, residual streams).
-- **Robust Modeling**: Train and evaluate neural network models (MLP and CNN architectures) with built-in cross-validation and metrics.
-- **Easy-to-use API**: Simple and intuitive functions for embedding extraction, aggregation, and modeling.
+| Area                       | What you get                                                                                                                                            |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Embedding extraction**   | Fast batched capture of hidden states from decoder‑only and encoder‑decoder models, with EOS remapping and token masking.                               |
+| **Aggregation helpers**    | Collapse many‑layer, many‑part tensors into row‑major matrices ready for Pandas/SciKit or keep them compressed in NumPy `.npz`.                         |
+| **Capacity‑scaled models** | Residual MLP (`PlugClassifier`) and supervised‑contrastive CNN (`PlugContrastiveCNN`) that size themselves so that params ≈ `target_ratio × N_samples`. |
+| **Training API**           | `fit` (single split) and `cross_validate` (outer + inner splits, early stopping, learning‑curve PNG).                                                   |
+| **Artifact I/O**           | `save_artifacts` / `load_artifacts` store both weights **and** the meta needed to rebuild the exact geometry later.                                     |
 
 ---
 
 ## Installation
 
-Install from source:
-
 ```bash
-git clone https://github.com/tatonetti-lab/plug.git
-cd plug
-pip install .
+pip install git+https://github.com/tatonetti-lab/plug.git
 ```
+
+> Instead of cloning, you can also add Plug as a sub‑module and install with `pip install -e .` if you plan to hack the source.
 
 ---
 
-## Quickstart
+## Quick‑start examples
 
-### Extract embeddings from a HuggingFace model:
+### 1 – Extract embeddings
 
 ```python
 from plug.embeddings import embed_dataset
@@ -42,12 +47,12 @@ embed_dataset(
     output_dir="embeddings",
     device="cuda:0",
     layers=[0, 1, 7],
-    parts=["attn", "mlp", "rs"],
+    parts=["attn", "mlp", "rs"],  # residual stream
     eos_token="<end_of_turn>"
 )
 ```
 
-### Aggregate embeddings into a structured dataset:
+### 2 – Aggregate to features
 
 ```python
 from plug.extraction import extract_token_vectors
@@ -61,129 +66,129 @@ extract_token_vectors(
 )
 ```
 
-### Evaluate a model:
+### 3 – Cross‑validate a model
 
 ```python
+import pandas as pd
 from plug.model import load_npz_features, cross_validate
 
 X, meta = load_npz_features("embeddings/features.npz")
 y = pd.read_csv("data/labels.csv", index_col="id")
 
-preds = cross_validate(
+preds, summary = cross_validate(
     X, y,
-    model_type="mlp",
-    meta=meta,
-    n_epochs=50,
-    learning_rate=1e-3,
-    batch_size=64,
+    model_type="cnn",                # "mlp" or "cnn"
+    meta=meta,                       # carries parts/layers/hidden info
+    n_epochs=60,
+    learning_rate=3e-4,
+    batch_size=128,
     device="cuda",
+    inner_val_split=0.1,
     early_stopping=True,
-    patience=5
+    patience=8,
 )
+print(summary["overall_metric"])
 ```
 
 ---
 
-### Model Architectures
+## Model architectures and sizing heuristics
 
-Plug provides two primary neural network architectures for modeling embeddings: a **Residual MLP** (`PlugClassifier`) and a **CNN-based model** (`PlugContrastiveCNN`). Both models are designed to be robust, interpretable, and easy to configure.
+### 1. Residual MLP — `PlugClassifier`
 
----
+| Symbol | Meaning                                             |
+| ------ | --------------------------------------------------- |
+| `d`    | input feature dimension                             |
+| `N`    | number of training examples (optional at inference) |
+| `r`    | `target_ratio` (default 5.0)                        |
+| `cap`  | `width_cap` (default 128)                           |
+| `min`  | lower bound 16                                      |
 
-### 1. Residual MLP (`PlugClassifier`)
+The first hidden width is chosen so that the total parameter count tracks the data size:
 
-The Residual MLP is a fully-connected neural network with a residual connection, designed to adapt its width based on the input embedding dimension (`input_dim`). The architecture consists of:
+$$
+\texttt{fc1\_w} = \operatorname{clip}\Big( \left\lfloor r \; N / d \right\rfloor ,\; \text{min},\; \text{cap} \Big)\tag{1}
+$$
 
-- **Input Layer**: Accepts embedding vectors of dimension `input_dim`.
-- **Hidden Layers**:
-  - **First hidden layer**: Width is calculated as `fc1_w = clip(4 × input_dim, min=128, max=1024)`.
-  - **Second hidden layer**: Width is half of the first layer (`fc2_w = fc1_w // 2`).
-  - **Residual connection**: A parallel residual block with the same width as the second hidden layer (`fc2_w`), added to the output of the second hidden layer.
-- **Output Layer**: A final linear layer reduces the dimension to a single scalar output (logit). For classification tasks, a sigmoid activation is applied externally.
+Subsequent widths follow simple halves/quarters:
 
-**Parameter Calculation**:
+```
+fc2_w  = max(16, fc1_w // 2)
+out_w  = max(out_floor, fc2_w // 4)   # out_floor = 16 by default
+```
 
-- `fc1_w = clip(4 × input_dim, min=128, max=1024)`
-- `fc2_w = fc1_w // 2`
-- `out_w = max(64, fc2_w // 4)`
+The network layout is
 
-**Total Layers**: 3 fully-connected layers plus one residual block.
+```
+Input → FC1 → BN → ReLU → Dropout →
+        FC2 → BN → ReLU → Dropout + Residual →
+        Output block (BN, ReLU, Dropout, Linear)
+```
 
----
+> **Param heuristic**: By design the number of trainable parameters is $\approx r \times N$. That means you can scale to larger datasets simply by raising `N`—no manual width tuning required.
 
-### 2. CNN-based Model (`PlugContrastiveCNN`)
+### 2. Supervised‑contrastive CNN — `PlugContrastiveCNN`
 
-The CNN-based model leverages convolutional layers to capture spatial relationships across embedding layers and parts (e.g., residual stream, attention, MLP). It consists of two main components:
+Let
 
-- **CNN Encoder (`PlugCNNEncoder`)**:
-  - **Input Shape**: `(batch_size, n_layers, hidden_size)` if using a single embedding part, or `(batch_size, n_layers, n_parts, hidden_size)` if multiple parts are used.
-  - **Normalization**: Layer normalization applied across the embedding dimension.
-  - **Convolutional Backbone**:
-    - For single-part embeddings (`n_parts=1`), uses 1D convolutions:
-      - Conv1d → BatchNorm → ReLU → Conv1d → BatchNorm → ReLU → Conv1d → ReLU → AdaptiveAvgPool1d → Flatten → Dropout
-    - For multi-part embeddings (`n_parts>1`), uses 2D convolutions:
-      - Conv2d → BatchNorm → ReLU → Conv2d → BatchNorm → ReLU → Conv2d → ReLU → AdaptiveAvgPool2d → Flatten → Dropout
-  - **Projection Dimension**: Final embedding dimension (`proj_dim`) defaults to 128.
+* `parts` = number of embedding components (1 = just residual stream, 3 = rs+attn+mlp, …)
+* `L` = number of transformer layers kept
+* `h` = hidden size of the parent model
 
-- **Classifier Head**:
-  - A small fully-connected network maps the CNN encoder output (`proj_dim`) to a single scalar logit.
-  - Structure: Linear → ReLU → Dropout → Linear → ReLU → Dropout → Linear (output).
+The encoder starts by computing a **base channel count**
 
-**Parameter Calculation**:
+$$
+\text{base} = \operatorname{clip}\Big( \sqrt{\, r \; N / 10\,},\; 8,\; cap \Big)\tag{2}
+$$
 
-- CNN channel sizes are dynamically set based on the number of layers (`n_layers`):
-  - `c1 = max(128, 4 × n_layers)`
-  - `c2 = max(256, 2 × c1)`
-- Kernel sizes:
-  - Single-part (1D): kernels of size 5 and 3.
-  - Multi-part (2D): kernels of height `k_h = min(3, n_parts)` and width 5.
+Channel widths are then
 
-**Total Layers**: 3 convolutional layers in the encoder, followed by 3 linear layers in the classifier head.
+```
+c1 = base
+c2 = base * 2
+proj_dim = max(32, base * proj_mult)   # proj_mult defaults to 2
+```
 
----
+The convolution stack (kernel height `k_h = 3` unless `parts ≤ 2`) is followed by global average pooling, flattening and dropout. The projection is fed to a small MLP head for logits **and** returned as an embedding for optional *supervised contrastive loss*:
 
-### Early Stopping
+$$
+\mathcal L = \mathcal L_{\text{CE}} + \lambda \; \mathcal L_{\text{SupCon}}\tag{3}
+$$
 
-Both models support early stopping during training to prevent overfitting:
-
-- **Mechanism**: After each evaluation epoch, the validation metric (ROC-AUC for classification, MSE for regression) is monitored.
-- **Patience**: If the validation metric does not improve for a specified number of epochs (`patience`, default=10), training stops early.
-- **Best Model Selection**: The model state corresponding to the best validation metric is retained.
-
----
-
-### Contrastive Loss (CNN only)
-
-The CNN model optionally incorporates a supervised contrastive loss (`SupConLoss`) to improve embedding quality:
-
-- **Purpose**: Encourages embeddings of samples from the same class to be closer together, and embeddings from different classes to be farther apart.
-- **Temperature Parameter**: Default temperature (`τ`) is set to 0.07.
-- **Weighting**: The contrastive loss is combined with the standard classification loss (BCE) using a configurable weight (`contrastive_weight`, default=1.0).
+with `λ = contrastive_weight` (default 1.0) and temperature $\tau = 0.07$.
 
 ---
 
-### Important Notes
+## Training utilities
 
-- **Activation Functions**: Both models use ReLU activations internally. For classification tasks, the final sigmoid activation is applied externally during inference.
-- **Device Management**: Models automatically detect and utilize GPU (`cuda`) if available, otherwise defaulting to CPU.
-- **Batch Size and Learning Rate**: Default values (`batch_size=128`, `learning_rate=1e-3`) are provided, but tuning these hyperparameters based on your dataset is recommended.
+* **`fit`** Single‑split training loop with mini‑batching, early stopping and history logging.
+* **`cross_validate`** Outer CV with optional inner validation split, patience‑based early stopping, PNG learning curves and summary JSON.
+* **Early‑stopping logic** Stops when the monitored metric has not improved by `min_delta` for `patience` consecutive epochs after the first plateau.
 
 ---
 
+## Important notes for users
+
+* **Inference without `N`** When you load a model only for prediction, `n_examples` may be `None`. The geometry is then replayed exactly as stored in the JSON meta.
+* **Saved artifacts** `<prefix>.pt` (weights) + `<prefix>.json` (geometry + training hyper‑parameters). Keep them together.
+* **Metrics** Default monitored metric is **macro ROC‑AUC** for classification; choose `"loss"` to monitor cross‑entropy instead.
+* **Device selection** Every public API call accepts `device="cuda"` or `"cpu"`; if CUDA is unavailable the package silently falls back to CPU.
+* **Reproducibility** `random_state` controls NumPy, PyTorch and scikit‑learn shuffling; set it for exact repeatability.
+
+---
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request on GitHub.
+Pull requests and issues are welcome – please include a minimal reproducible example if reporting a bug.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+Plug is released under the MIT License. See the [LICENSE](LICENSE) file for full text.
 
 ---
 
-## 📧 Contact
+## Contact
 
-- **Author**: Jacob Berkowitz
-- **Email**: Jacob.Berkowitz2@cshs.org
+Jacob Berkowitz  ·  **[Jacob.Berkowitz2@cshs.org](mailto:Jacob.Berkowitz2@cshs.org)**
