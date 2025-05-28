@@ -107,7 +107,7 @@ print(summary["overall_metric"])
 The first hidden width is chosen so that the total parameter count tracks the data size:
 
 $$
-\texttt{fc1\_w} = \operatorname{clip}\Big( \left\lfloor r \; N / d \right\rfloor ,\; \text{min},\; \text{cap} \Big)\tag{1}
+fc1_w = \mathrm{clip}\Big( \left\lfloor r \; N / d \right\rfloor ,\; \text{min},\; \text{cap} \Big)\tag{1}
 $$
 
 Subsequent widths follow simple halves/quarters:
@@ -138,7 +138,7 @@ Let
 The encoder starts by computing a **base channel count**
 
 $$
-\text{base} = \operatorname{clip}\Big( \sqrt{\, r \; N / 10\,},\; 8,\; cap \Big)\tag{2}
+\text{base} = \mathrm{clip}\Big( \sqrt{\, r \; N / 10\,},\; 8,\; cap \Big)\tag{2}
 $$
 
 Channel widths are then
