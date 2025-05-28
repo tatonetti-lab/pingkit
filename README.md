@@ -66,7 +66,7 @@ extract_token_vectors(
 )
 ```
 
-### 3 – Cross‑validate a model
+### 3 – Cross‑validate evaluation
 
 ```python
 import pandas as pd
