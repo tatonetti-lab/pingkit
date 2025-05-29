@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/downloads/)
 
-Pattern Learning for Understanding Generation, or **Plug**, is a Python package that streamlines the journey from transformer activations to reproducible, capacity‑aware models. It includes utilities for
+Pattern Learning for Understanding Generation, or **Plug**, is a Python package that turns transformer activations into reproducible, capacity‑aware models. It includes utilities for
 
 * extracting last‑token embeddings from any 🤗 HuggingFace `AutoModel*`,
 * aggregating those embeddings into tidy feature matrices or compact `.npz` tensors, and
@@ -107,7 +107,7 @@ print(summary["overall_metric"])
 The first hidden width is chosen so that the total parameter count tracks the data size:
 
 $$
-fc1_w = \mathrm{clip}\Big( \left\lfloor r \; N / d \right\rfloor ,\; \text{min},\; \text{cap} \Big)\tag{1}
+fc1_w = \mathrm{clip}\Big( \left\lfloor r \; N / d \right\rfloor \; \text{min}\; \text{cap} \Big)\tag{1}
 $$
 
 Subsequent widths follow simple halves/quarters:
@@ -138,7 +138,7 @@ Let
 The encoder starts by computing a **base channel count**
 
 $$
-\text{base} = \mathrm{clip}\Big( \sqrt{\, r \; N / 10\,},\; 8,\; cap \Big)\tag{2}
+\text{base} = \mathrm{clip}\Big( \sqrt{\ r \; N / 10\}\; 8\; cap \Big)\tag{2}
 $$
 
 Channel widths are then
