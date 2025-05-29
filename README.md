@@ -106,9 +106,9 @@ print(summary["overall_metric"])
 
 The first hidden width is chosen so that the total parameter count tracks the data size:
 
-$$
-fc1_w = \mathrm{clip}\Big( \left\lfloor r \; N / d \right\rfloor \; \text{min}\; \text{cap} \Big)\tag{1}
-$$
+```
+fc1_w = clip(math.floor(r * N / d), min_width, width_cap)
+```
 
 Subsequent widths follow simple halves/quarters:
 
@@ -137,9 +137,9 @@ Let
 
 The encoder starts by computing a **base channel count**
 
-$$
-\text{base} = \mathrm{clip}\Big( \sqrt{\ r \; N / 10\}\; 8\; cap \Big)\tag{2}
-$$
+```
+base = clip(int(math.sqrt(r * N / 10)), 8, width_cap)
+```
 
 Channel widths are then
 
@@ -151,9 +151,9 @@ proj_dim = max(32, base * proj_mult)   # proj_mult defaults to 2
 
 The convolution stack (kernel height `k_h = 3` unless `parts ≤ 2`) is followed by global average pooling, flattening and dropout. The projection is fed to a small MLP head for logits **and** returned as an embedding for optional *supervised contrastive loss*:
 
-$$
-\mathcal L = \mathcal L_{\text{CE}} + \lambda \; \mathcal L_{\text{SupCon}}\tag{3}
-$$
+```
+L = L_CE + λ * L_SupCon
+```
 
 with `λ = contrastive_weight` (default 1.0) and temperature $\tau = 0.07$.
 
