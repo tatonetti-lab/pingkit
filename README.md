@@ -248,8 +248,6 @@ def fit(
 
 #### `cross_validate`
 
-> **Note:** The walkthrough example below uses `fit` instead of `cross_validate`, but `cross_validate` internally orchestrates outer + inner splits, trains per fold, and produces learning curves.
-
 ```python
 from typing import Union, Tuple, Any, List, Dict
 
@@ -464,7 +462,7 @@ class SupConLoss(nn.Module):
 
 ---
 
-## Walk‑through Example (Using `fit`)
+## Walk‑through Example
 
 Below is a complete example showing how to extract embeddings from text, aggregate them, load features, train a model with `fit`, and make predictions.
 
