@@ -454,7 +454,12 @@ MetricFn = Callable[[np.ndarray, np.ndarray], float]
 def _macro_roc_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     if y_prob.ndim == 1 or y_prob.shape[1] == 1:
         return roc_auc_score(y_true, y_prob.ravel())
-    return roc_auc_score(y_true, y_prob, multi_class="ovr", average="macro")
+    elif y_prob.shape[1] == 2:
+        # Binary classification: use probability of positive class
+        return roc_auc_score(y_true, y_prob[:, 1])
+    else:
+        # Multiclass classification
+        return roc_auc_score(y_true, y_prob, multi_class="ovr", average="macro")
 
 
 _METRIC_REGISTRY: dict[str, Tuple[MetricFn, str]] = {
@@ -464,9 +469,19 @@ _METRIC_REGISTRY: dict[str, Tuple[MetricFn, str]] = {
 }
 
 
-def _ensure_metric(metric: str | MetricFn) -> Tuple[MetricFn, str]:
+def _ensure_metric(metric: str | MetricFn) -> Tuple[MetricFn | None, str]:
+    """
+    Return (metric_fn | None, mode).
+
+    * If *metric* is a callable, we assume “higher‑is‑better”.
+    * If *metric* == "loss", we signal that we want to **minimise** the
+      cross‑entropy returned by `_evaluate()` by returning (None, "min").
+    * Otherwise look the metric up in the registry (higher‑is‑better).
+    """
     if callable(metric):
-        return metric, "max"
+        return metric, "max"          # user‑supplied scorer → maximise
+    if metric == "loss":
+        return None, "min"            # use CE/NLL, lower is better
     if metric not in _METRIC_REGISTRY:
         raise ValueError(f"Unknown metric {metric!r}")
     return _METRIC_REGISTRY[metric]
@@ -599,27 +614,29 @@ def fit(
     patience: int = 10,
     random_state: int | None = 101,
 ) -> Tuple[nn.Module, list[dict]]:
-    device = _select_device(device)
+    # --------------- setup & data -------------------------------------
+    device  = _select_device(device)
     X_np, _ = _to_numpy(X)
-    y_np = np.asarray(y, dtype=int)
+    y_np    = np.asarray(y, dtype=int)
 
-    # validation handling
+    # --------------- validation handling ------------------------------
     if validation_data is not None:
         X_val_np, _ = _to_numpy(validation_data[0])
-        y_val_np = np.asarray(validation_data[1], dtype=int)
+        y_val_np     = np.asarray(validation_data[1], dtype=int)
     elif val_split:
-        tr_idx, va_idx = _make_validation_split(y_np, val_fraction=val_split, random_state=random_state)
+        tr_idx, va_idx = _make_validation_split(
+            y_np, val_fraction=val_split, random_state=random_state
+        )
         X_val_np, y_val_np = X_np[va_idx], y_np[va_idx]
-        X_np, y_np = X_np[tr_idx], y_np[tr_idx]
+        X_np,    y_np      = X_np[tr_idx], y_np[tr_idx]
     else:
         X_val_np = y_val_np = None
-        early_stopping = False
+        early_stopping = False            # nothing to monitor
 
+    # --------------- metric bootstrap ---------------------------------
     metric_fn, metric_mode = _ensure_metric(metric)
-    if metric == "loss":
-        metric_fn = None
-        metric_mode = "min"
 
+    # --------------- model / optimiser / loss -------------------------
     model = _make_model(
         model_type,
         input_dim=X_np.shape[1],
@@ -627,17 +644,25 @@ def fit(
         num_classes=num_classes,
         n_examples=len(X_np),
     ).to(device)
-    opt = optim.Adam(model.parameters(), lr=learning_rate)
-    ce_loss = nn.CrossEntropyLoss()
-    supcon = SupConLoss().to(device) if model_type == "cnn" else None
 
-    ds = torch.utils.data.TensorDataset(torch.tensor(X_np), torch.tensor(y_np, dtype=torch.long))
+    opt     = optim.Adam(model.parameters(), lr=learning_rate)
+    ce_loss = nn.CrossEntropyLoss()
+    supcon  = SupConLoss().to(device) if model_type == "cnn" else None
+
+    # --------------- dataloader ---------------------------------------
+    ds     = torch.utils.data.TensorDataset(
+        torch.tensor(X_np), torch.tensor(y_np, dtype=torch.long)
+    )
     loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
 
-    stopper = EarlyStopping(patience=patience, mode=metric_mode)
+    # --------------- training loop ------------------------------------
+    stopper           = EarlyStopping(patience=patience, mode=metric_mode)
     history: list[dict] = []
+    best_state_dict: dict[str, torch.Tensor] | None = None
+    best_metric                         = math.inf if metric_mode == "min" else -math.inf
 
-    for ep in tqdm(range(1, n_epochs + 1), desc="Fit", ncols=80):
+    pbar = tqdm(range(1, n_epochs + 1), desc="Fit", ncols=80)
+    for ep in pbar:
         tr_loss = _train_one_epoch(
             model,
             loader,
@@ -649,30 +674,59 @@ def fit(
             device=device,
         )
 
+        # ---------- compute validation metric --------------------------
         val_metric = math.nan
         if X_val_np is not None:
-            _, val_metric, _ = _evaluate(
-                model,
-                X_val_np,
-                y_val_np,
-                model_type=model_type,
-                metric_fn=(metric_fn or _macro_roc_auc),
-                ce_loss=ce_loss if metric == "loss" else None,
-                device=device,
-            )
+            if metric == "loss":
+                _, _, val_metric = _evaluate(
+                    model,
+                    X_val_np,
+                    y_val_np,
+                    model_type=model_type,
+                    metric_fn=None,
+                    ce_loss=ce_loss,
+                    device=device,
+                )
+            else:
+                _, val_metric, _ = _evaluate(
+                    model,
+                    X_val_np,
+                    y_val_np,
+                    model_type=model_type,
+                    metric_fn=metric_fn or _macro_roc_auc,
+                    ce_loss=None,
+                    device=device,
+                )
 
         history.append({"epoch": ep, "train_loss": tr_loss, "val_metric": val_metric})
+        pbar.set_postfix({"train_loss": f"{tr_loss:.4f}", "val_metric": f"{val_metric:.4f}"})
 
+        # ---------- track best model -----------------------------------
+        if X_val_np is not None and not math.isnan(val_metric):
+            improved = (
+                (metric_mode == "max" and val_metric > best_metric) or
+                (metric_mode == "min" and val_metric < best_metric)
+            )
+            if improved:
+                best_metric      = val_metric
+                # keep a *CPU* copy so GPU memory isn’t hogged
+                best_state_dict  = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        # ---------- early‑stopping check -------------------------------
         if early_stopping and X_val_np is not None and stopper.step(val_metric):
             LOGGER.info("Early stopping at epoch %d (best=%.4f)", ep, stopper.best)
             break
+
+    # --------------- restore best weights -----------------------------
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+        LOGGER.info("Restored best weights (val_metric %.4f).", best_metric)
 
     model.eval()
     return model, history
 
 
 # cross‑validation
-
 
 def cross_validate(
     X: Union[pd.DataFrame, np.ndarray],
@@ -699,6 +753,8 @@ def cross_validate(
     out_dir: str = "artifacts",
     run_name: str | None = None,
 ) -> Tuple[np.ndarray, dict]:
+
+    # ---------- bookkeeping & splits ----------------------------------
     if run_name is None:
         run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
     full_out_dir = os.path.join(out_dir, run_name)
@@ -718,30 +774,30 @@ def cross_validate(
             splitter = LeaveOneGroupOut().split(X, y_vec, groups)
             n_splits = len(np.unique(groups))
         else:
-            splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state).split(X, y_vec)
+            splitter = StratifiedKFold(
+                n_splits=n_splits, shuffle=True, random_state=random_state
+            ).split(X, y_vec)
+
     split_gen = list(splitter)
 
-    device = _select_device(device)
+    # ---------- metric bootstrap --------------------------------------
+    metric_fn, metric_mode = _ensure_metric(metric)
+    metric_name = metric if isinstance(metric, str) else getattr(metric_fn, "__name__", "metric")
+
+    device  = _select_device(device)
     X_np, _ = _to_numpy(X)
     ce_loss = nn.CrossEntropyLoss()
+    supcon  = SupConLoss().to(device) if model_type == "cnn" else None
 
-    if metric == "loss":
-        metric_fn = None
-        metric_mode = "min"
-        metric_name = "loss"
-    else:
-        metric_fn, metric_mode = _ensure_metric(metric)
-        metric_name = metric if isinstance(metric, str) else metric_fn.__name__
-
-    supcon = SupConLoss().to(device) if model_type == "cnn" else None
-
-    preds = np.zeros((len(y_vec), num_classes), np.float32)
-    curve_data, fold_stats = [], []
-    t0 = time.time()
+    preds      = np.zeros((len(y_vec), num_classes), np.float32)
+    curve_data = []
+    fold_stats = []
+    t0         = time.time()
 
     for fold, (tr, te) in enumerate(split_gen, 1):
         LOGGER.info("Fold %d/%d - training …", fold, len(split_gen))
 
+        # ---------- inner validation split -----------------------------
         if inner_val_split and inner_val_split > 0.0:
             tr_idx, va_idx = _make_validation_split(
                 y_vec[tr], val_fraction=inner_val_split, random_state=random_state
@@ -752,12 +808,14 @@ def cross_validate(
 
         fold_early_stop = early_stopping and (va_inner is not None)
 
+        # ---------- dataloader ----------------------------------------
         ds = torch.utils.data.TensorDataset(
             torch.tensor(X_np[tr_inner]),
             torch.tensor(y_vec[tr_inner], dtype=torch.long),
         )
         loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
 
+        # ---------- model / opt ---------------------------------------
         model = _make_model(
             model_type,
             input_dim=X_np.shape[1],
@@ -765,11 +823,15 @@ def cross_validate(
             num_classes=num_classes,
             n_examples=len(tr_inner),
         ).to(device)
-        opt = optim.Adam(model.parameters(), lr=learning_rate)
+        opt     = optim.Adam(model.parameters(), lr=learning_rate)
         stopper = EarlyStopping(patience=patience, mode=metric_mode)
+
+        best_state_dict: dict[str, torch.Tensor] | None = None
+        best_metric_fold                     = math.inf if metric_mode == "min" else -math.inf
 
         epochs_seen, metrics_seen = [], []
 
+        # -------------- epoch loop ------------------------------------
         for ep in range(1, n_epochs + 1):
             _train_one_epoch(
                 model,
@@ -783,6 +845,7 @@ def cross_validate(
             )
 
             if ep % eval_every == 0 or ep == n_epochs:
+                # ----- validation / train metric ----------------------
                 val_metric = math.nan
                 if va_inner is not None:
                     _, s_val, l_val = _evaluate(
@@ -809,23 +872,35 @@ def cross_validate(
 
                 LOGGER.info(
                     "Fold %d ep %3d | train_%s %.4f val_%s %.4f",
-                    fold,
-                    ep,
-                    metric_name,
-                    train_metric,
-                    metric_name,
-                    val_metric,
+                    fold, ep, metric_name, train_metric, metric_name, val_metric
                 )
 
                 epochs_seen.append(ep)
                 metrics_seen.append(val_metric)
 
+                # -------- track best model for this fold --------------
+                if va_inner is not None and not math.isnan(val_metric):
+                    improved = (
+                        (metric_mode == "max" and val_metric > best_metric_fold) or
+                        (metric_mode == "min" and val_metric < best_metric_fold)
+                    )
+                    if improved:
+                        best_metric_fold = val_metric
+                        best_state_dict  = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
                 if fold_early_stop and stopper.step(val_metric):
                     LOGGER.info(
-                        "Fold %d - early stop at epoch %d (best=%.4f)", fold, ep, stopper.best
+                        "Fold %d - early stop at epoch %d (best=%.4f)",
+                        fold, ep, stopper.best
                     )
                     break
 
+        # -------- restore best weights for this fold ------------------
+        if best_state_dict is not None:
+            model.load_state_dict(best_state_dict)
+            LOGGER.info("Fold %d - restored best weights (val %.4f)", fold, best_metric_fold)
+
+        # -------- test‑split evaluation -------------------------------
         y_prob_test, s_test, l_test = _evaluate(
             model,
             X_np[te],
@@ -843,6 +918,7 @@ def cross_validate(
 
         LOGGER.info("Fold %d finished - %s %.4f", fold, metric_name, fold_metric_val)
 
+    # ---------- aggregate results -------------------------------------
     if metric == "loss":
         overall_metric = ce_loss(torch.tensor(preds), torch.tensor(y_vec)).item()
     else:
@@ -857,12 +933,17 @@ def cross_validate(
         "folds": fold_stats,
     }
 
+    # ---------- curve plotting / JSON dump (unchanged) ----------------
     if curve_data and any(cd["metrics"] for cd in curve_data):
         plt.figure()
         vmin = min(min(cd["metrics"]) for cd in curve_data if cd["metrics"])
         for cd in curve_data:
             plt.scatter(cd["epochs"], cd["metrics"], s=12, alpha=0.4)
-            plt.plot(cd["epochs"], pd.Series(cd["metrics"]).rolling(3, min_periods=1).mean(), label=f"fold {cd['fold']}")
+            plt.plot(
+                cd["epochs"],
+                pd.Series(cd["metrics"]).rolling(3, min_periods=1).mean(),
+                label=f"fold {cd['fold']}",
+            )
         plt.ylabel(metric_name)
         if metric_mode == "max":
             plt.ylim(vmin - 0.05, 1.0)
