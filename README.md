@@ -464,157 +464,222 @@ class SupConLoss(nn.Module):
 
 ## Walk‑through Example
 
-Below is a complete example showing how to extract embeddings from text, aggregate them, load features, train a model with `fit`, and make predictions.
+Below is a complete example showing how to go from raw text prompts to embeddings, feature extraction, model training, evaluation, and plotting—using in‑memory DataFrames instead of reading directly from CSVs in each function call.
+
+---
+
+### 1. Prepare and format prompts
 
 ```python
-#!/usr/bin/env python3
-# Example: text → embeddings → features → training → prediction
-
-import os
 import pandas as pd
-
-# 1. Extract embeddings from raw text
-# -----------------------------------
-# Assume you have a CSV `data/prompts.csv` with columns: id, prompt
-# and a separate `data/labels.csv` with columns: id, label (0/1 or multiclass).
-
 from plug.embedding import embed_dataset
 
-# Create an output directory for embeddings
-os.makedirs("embeddings", exist_ok=True)
+# Load raw prompts; must have columns ['id', 'prompt']
+df = pd.read_csv('mmlu_prompts_ts.csv', index_col='id')
 
+# Wrap each question in an instruction template
+df['prompt'] = df['prompt'].apply(
+    lambda x: (
+        "<start_of_turn>user\n" + x + "<end_of_turn>\n"
+        "<start_of_turn>model\nAnswer: "
+    )
+)
+```
+
+**What happens:**
+
+* `df` is a `DataFrame` of shape `(n_samples, 1)`, indexed by `id`.
+* Each `prompt` now looks like:
+
+| id | prompt                                                                           |
+| -- | -------------------------------------------------------------------------------- |
+| q1 | `<start_of_turn>user\nWhat is 2+2?<end_of_turn>\n<start_of_turn>model\nAnswer: ` |
+| q2 | `<start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\nAnswer: `          |
+
+---
+
+### 2. Extract token‑level embeddings
+
+```python
 embed_dataset(
-    data="data/prompts.csv",       # Path to CSV with columns 'id' and 'prompt'
-    input_col="prompt",            # Column containing text inputs
-    model_name="google/gemma-2b-it",  # HF model to use
-    output_dir="embeddings",       # Root dir for per‑part subfolders
-    device="cuda:0",               # Or "cpu"
-    layers=[0, 1, 7],               # Extract layers 0, 1, and 7
-    parts=["rs", "attn", "mlp"],
-    pooling=["mean"],              # Pool by mean over valid tokens
-    eos_token="<end_of_turn>",     # Token string to identify EOS in filtering
-    filter_non_text=True,            # Skip punctuation/duplicates
+    data=df,
+    input_col='prompt',
+    output_dir='mmlu_answer',
+    model_name='google/gemma-2-9b-it',
+    eos_token='<end_of_turn>',
+    device='cuda:0',
+    pooling='mean'
 )
+```
 
-# This will write files like:
-#   embeddings/rs/<id>_L00.csv
-#   embeddings/attn/<id>_L00.csv
-#   embeddings/mlp/<id>_L00.csv
-#   embeddings/rs/<id>_L01.csv, etc.
+* Creates subdirectories under `mmlu_answer/`:
 
+  ```
+  mmlu_answer/rs/    # residual streams
+  mmlu_answer/attn/  # attention outputs
+  mmlu_answer/mlp/   # MLP outputs
+  ```
+* Within `rs/`, for example, each file `<id>_L<layer>.csv` is a column vector of shape `(hidden_size,)`.
 
-# 2. Aggregate embeddings into feature matrices
-# ---------------------------------------------
+---
 
+### 3. Aggregate embeddings into a compressed NPZ
+
+```python
 from plug.extraction import extract_token_vectors
+import os
 
-# Collapse the CSVs into a compressed NPZ and optional CSV
+layer = 35
 npz_path = extract_token_vectors(
-    embedding_dir="embeddings",   # Directory written by embed_dataset
-    parts=["rs", "attn", "mlp"],
-    layers=[0, 1, 7],              # Same layers as above
-    output_file="embeddings/features",  # Will append .npz
-    save_csv=True,                 # Also write a transposed CSV
+    embedding_dir='mmlu_answer',
+    output_file=f'mmlu_answer/results/features_rs_L{layer}',
+    layers=layer,
+    parts='rs',
+    n_jobs=os.cpu_count(),
 )
-# npz_path is now "embeddings/features.npz"
+print("✅   stacked features:", npz_path)
+```
 
-# You can inspect the CSV if desired:
-#   embeddings/features.csv  (rows indexed by id, columns as features)
+* **Output:** `mmlu_answer/results/features_rs_L35.npz`
+* **Inside the NPZ:**
 
+  * `data`: array of shape `(hidden_size, n_samples)`
+  * `columns`: list of sample IDs (`n_samples` long)
+  * Metadata: `parts=['rs']`, `layers=[35]`, `hidden_size` integer
 
-# 3. Load features and labels for training
-# -----------------------------------------
+---
 
-from plug.model import load_npz_features, fit, save_artifacts, predict
+### 4. Load features and raw labels
 
-# Load the NPZ into a DataFrame and metadata
+```python
+from plug.model import load_npz_features
+import pandas as pd
+
+# Load the NPZ into a DataFrame
 X_df, meta = load_npz_features(npz_path)
-# X_df: DataFrame shape (n_samples, n_features), index is id
+print(X_df.shape)    # e.g. (20000, 1024)
+print(meta)          # e.g. {'parts': ['rs'], 'layers': [35], 'hidden_size': 1024}
 
-# Load labels CSV; assume it has columns ['id', 'label']
-labels_df = pd.read_csv("data/labels.csv", index_col="id")
-# Align features and labels
-common_ids = X_df.index.intersection(labels_df.index)
-X_train = X_df.loc[common_ids]
-y_train = labels_df.loc[common_ids, "label"].astype(int)
+# Load raw answers and map from letters to integers
+y_raw = pd.read_csv('mmlu_g.csv', index_col='id')['answer']
+mapping = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+y_series = y_raw.map(mapping).fillna(0).astype(int)
+```
 
-# 4. Train a model with `fit`
-# ----------------------------
+* **Data shapes:**
 
-# Create a directory to store trained artifacts
-os.makedirs("artifacts", exist_ok=True)
+  * `X_df`: `(n_samples, hidden_size)`
+  * `y_series`: `(n_samples,)` with integer labels in `[0,3]`
 
+---
+
+### 5. Align and split into train/test
+
+```python
+from sklearn.model_selection import train_test_split
+
+# Keep only samples present in both X and y
+common = X_df.index.intersection(y_series.index)
+X_df = X_df.loc[common]
+y_series = y_series.loc[common]
+
+# Stratified split: 5,000 examples for training
+X_train, X_test, y_train, y_test = train_test_split(
+    X_df,
+    y_series,
+    train_size=5000,
+    stratify=y_series,
+    shuffle=True,
+    random_state=405,
+)
+print("Train:", X_train.shape, "Test:", X_test.shape)
+```
+
+* **Resulting shapes:**
+
+  * Training: `(5000, hidden_size)`
+  * Test: `(n_test, hidden_size)`
+
+---
+
+### 6. Train an MLP classifier
+
+```python
 model, history = fit(
     X_train,
-    y_train,
-    model_type="cnn",       # "mlp" or "cnn" (requires meta for "cnn")
-    meta=meta,               # Necessary when model_type="cnn"
-    num_classes=len(y_train.unique()),
+    y_train.values,
+    model_type='mlp',
+    meta=meta,
+    num_classes=4,
+    metric='loss',
+    batch_size=128,
+    learning_rate=1e-2,
+    contrastive_weight=0.4,
     n_epochs=100,
-    learning_rate=3e-4,
-    batch_size=64,
-    device="cuda:0",        # Or "cpu"
-    contrastive_weight=1.0,  # Only used if model_type="cnn"
-    val_split=0.1,           # Reserve 10% for validation internally
-    metric="roc_auc",       # Monitor ROC‑AUC
+    val_split=0.2,
     early_stopping=True,
-    patience=10,
-    random_state=42,
+    random_state=405,
 )
+```
 
-# `history` is a list of dicts: [{'epoch':1, 'train_loss':..., 'val_metric':...}, ...]
-for record in history[-5:]:  # print last 5 epochs
-    print(record)
+* **`history`:** List of dicts with keys:
 
-# 5. Save model weights + metadata
-# --------------------------------
+  * `epoch`: epoch number
+  * `train_loss`: training loss
+  * `val_metric`: validation loss (since `metric='loss'`)
+
+---
+
+### 7. Save and reload model artifacts
+
+```python
+from plug.model import save_artifacts, load_artifacts
 
 weights_path, meta_path = save_artifacts(
     model,
-    path="artifacts/plug_final",  # Will create plug_final.pt + plug_final.json
-    meta={"created_by": "example_script"},
+    path=f'artifacts/mmlu_rs_L{layer}',
+    meta=meta
 )
-print("Saved model to:", weights_path)
-print("Saved meta to:", meta_path)
+print("Saved:", weights_path, meta_path)
 
-# 6. Make predictions on new data
-# -------------------------------
-
-# Suppose you have a set of test prompts:
-# test_prompts.csv with columns ['id', 'prompt']
-embed_dataset(
-    data="data/test_prompts.csv",
-    input_col="prompt",
-    model_name="google/gemma-2b-it",
-    output_dir="embeddings_test",
-    device="cuda:0",
-    layers=[0, 1, 7],
-    parts=["rs", "attn", "mlp"],
-    pooling=["mean"],
-    eos_token="<end_of_turn>",
-    filter_non_text=True,
-)
-
-npz_test = extract_token_vectors(
-    embedding_dir="embeddings_test",  
-    parts=["rs", "attn", "mlp"],
-    layers=[0, 1, 7],
-    output_file="embeddings_test/features_test",
-    save_csv=False,
-)
-
-# Use `predict` to load features and run inference
-pred_df = predict(
-    features=npz_test,
-    model_path="artifacts/plug_final",  # Prefix to .pt/.json
-    output_csv="test_predictions.csv",
-    response_csv=None,   # If no ground truth available
-    device="cuda:0",
-    batch_size=256,
-)
-
-print(pred_df.head())  # Contains 'id' and 'prob_positive' (binary) or 'prob_class_{i}'
+# Later…
+model, meta = load_artifacts(f'artifacts/mmlu_rs_L{layer}', device='cuda')
 ```
+
+* Saves `artifacts/mmlu_rs_L35.pt` and `.json` metadata
+
+---
+
+### 8. Evaluate on test set
+
+```python
+from plug.model import _evaluate
+import numpy as np
+from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.calibration import calibration_curve
+
+# Prepare data for evaluation
+device = next(model.parameters()).device
+X_test_np = X_test.values.astype(np.float32)
+
+probs, test_acc, _ = _evaluate(
+    model,
+    X_test_np,
+    y_test.values,
+    model_type='mlp',
+    metric_fn=lambda y, p: accuracy_score(y, p.argmax(1)),
+    device=device
+)
+
+auc = roc_auc_score(
+    y_test.values,
+    probs,
+    multi_class='ovr',
+    average='macro'
+)
+print(f"ACC {test_acc:.4f}   AUC {auc:.4f}")
+```
+
 
 ---
 
