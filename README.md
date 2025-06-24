@@ -5,6 +5,7 @@ Pattern Learning for Understanding Generation (Plug) is a Python package
 * Extracting hidden states and embeddings from any Hugging Face `AutoModel`.
 * Aggregating those embeddings into feature matrices or compact `.npz` tensors.
 * Training two neural architectures (MLP and CNN) that automatically size themselves based on data.
+* Creating custom probes and models tailored to your specific research needs.
 
 ---
 
@@ -23,6 +24,12 @@ git clone https://github.com/tatonetti-lab/plug.git
 cd plug
 pip install -e .
 ```
+
+---
+
+## Tutorials
+
+For advanced usage including creating custom models and probes, check out the **Custom Models Tutorial** notebook in the repository examples.
 
 ---
 

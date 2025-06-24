@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -289,36 +290,88 @@ def _to_numpy(X: Union[pd.DataFrame, np.ndarray]) -> Tuple[np.ndarray, np.ndarra
 
 
 def _make_model(
-    model_type: str,
+    model_spec: Union[str, Callable],
     *,
     input_dim: int,
-    meta: dict | None,
+    meta: dict | None = None,
     num_classes: int = 2,
     n_examples: int | None = None,
     target_ratio: float = 5.0,
     p_drop: float = 0.3,
-):
-    if model_type == "mlp":
-        return PlugClassifier(
-            input_dim,
-            num_classes,
-            n_examples=n_examples,
-            target_ratio=target_ratio,
-            p_drop=p_drop,
-        )
-    if model_type == "cnn":
-        if meta is None:
-            raise ValueError("meta required for CNN.")
-        return PlugContrastiveCNN(
-            len(meta["parts"]),
-            len(meta["layers"]),
-            meta["hidden_size"],
-            num_classes=num_classes,
-            n_examples=n_examples,
-            target_ratio=target_ratio,
-            p_drop=p_drop,
-        )
-    raise ValueError(f"Unknown model_type {model_type!r}")
+    **model_kwargs
+) -> nn.Module:
+    """
+    Create a model from specification.
+    
+    Args:
+        model_spec: Either a string for built-in models ("mlp", "cnn") or a callable factory
+        input_dim: Input feature dimension
+        meta: Metadata (required for CNN)
+        num_classes: Number of output classes
+        n_examples: Number of training examples
+        target_ratio: Parameter scaling ratio
+        p_drop: Dropout probability
+        **model_kwargs: Additional arguments passed to custom model factories
+        
+    Returns:
+        nn.Module: Instantiated model
+    """
+    if isinstance(model_spec, str):
+        # Built-in models
+        if model_spec == "mlp":
+            return PlugClassifier(
+                input_dim,
+                num_classes,
+                n_examples=n_examples,
+                target_ratio=target_ratio,
+                p_drop=p_drop,
+            )
+        elif model_spec == "cnn":
+            if meta is None:
+                raise ValueError("meta required for CNN.")
+            return PlugContrastiveCNN(
+                len(meta["parts"]),
+                len(meta["layers"]),
+                meta["hidden_size"],
+                num_classes=num_classes,
+                n_examples=n_examples,
+                target_ratio=target_ratio,
+                p_drop=p_drop,
+            )
+        else:
+            raise ValueError(f"Unknown built-in model '{model_spec}'. Available: ['mlp', 'cnn']")
+    
+    elif callable(model_spec):
+        # Custom model factory
+        try:
+            # Try with full signature first
+            return model_spec(
+                input_dim=input_dim,
+                num_classes=num_classes,
+                n_examples=n_examples,
+                meta=meta,
+                target_ratio=target_ratio,
+                p_drop=p_drop,
+                **model_kwargs
+            )
+        except TypeError:
+            # Fallback for simpler signatures - just pass the essentials
+            try:
+                return model_spec(input_dim, num_classes, **model_kwargs)
+            except TypeError:
+                # Last resort - minimal signature
+                return model_spec(input_dim, num_classes)
+    
+    else:
+        raise TypeError(f"model_spec must be str or callable, got {type(model_spec)}")
+
+
+def _should_use_contrastive_loss(model_spec: Union[str, Callable], model: nn.Module) -> bool:
+    """Determine if the model should use contrastive loss."""
+    if isinstance(model_spec, str):
+        return model_spec == "cnn"
+    # For custom models, check if it's a PlugContrastiveCNN or returns tuples
+    return isinstance(model, PlugContrastiveCNN)
 
 
 def _forward(model: nn.Module, xb: torch.Tensor, model_type: str) -> Tuple[torch.Tensor, torch.Tensor | None]:
@@ -343,36 +396,107 @@ def save_artifacts(
     *,
     path: str = "artifacts/plug",
     meta: dict | None = None,
+    model_factory: Callable | None = None,  # NEW: reconstruction function
+    model_kwargs: dict | None = None,       # NEW: factory arguments
 ) -> Tuple[str, str]:
-    """Serialise weights (.pt) + mini‑meta (.json)."""
+    """Serialise weights (.pt) + mini‑meta (.json).
+    
+    For custom models, provide model_factory and model_kwargs for reconstruction:
+    
+    save_artifacts(
+        model, 
+        path="my_model",
+        model_factory=my_probe_factory,
+        model_kwargs={"hidden_dim": 128, "num_heads": 4}
+    )
+    """
     prefix = _path_prefix(path)
     os.makedirs(os.path.dirname(prefix) or ".", exist_ok=True)
 
     if isinstance(model, PlugClassifier):
         mtype = "mlp"
         num_classes = model.out[-1].out_features
+        meta_out: dict = {"model_type": mtype, "num_classes": num_classes}
+        meta_out["input_dim"] = int(model.fc1[0].in_features)
+        meta_out["n_examples"] = getattr(model, "n_examples", None)
+        meta_out["target_ratio"] = getattr(model, "target_ratio", 5.0)
+        meta_out["p_drop"] = getattr(model, "p_drop", 0.3)
+        meta_out["width_cap"] = getattr(model, "width_cap", 128)
+        
     elif isinstance(model, PlugContrastiveCNN):
         mtype = "cnn"
         num_classes = model.classifier[-1].out_features
-    else:
-        raise TypeError(f"Unsupported model class {type(model)}")
-
-    meta_out: dict = {"model_type": mtype, "num_classes": num_classes}
-
-    if mtype == "mlp":
-        meta_out["input_dim"] = int(model.fc1[0].in_features)
-    else:
+        meta_out: dict = {"model_type": mtype, "num_classes": num_classes}
         meta_out["parts"] = model.n_parts
         meta_out["layers"] = model.n_layers
         meta_out["hidden_size"] = model.hidden
-
-    meta_out["n_examples"] = getattr(model, "n_examples", None)
-    meta_out["target_ratio"] = getattr(model, "target_ratio", 5.0)
-    meta_out["p_drop"] = getattr(model, "p_drop", 0.3)
-    meta_out["width_cap"] = getattr(model, "width_cap", 64)
-    if mtype == "cnn":
+        meta_out["n_examples"] = getattr(model, "n_examples", None)
+        meta_out["target_ratio"] = getattr(model, "target_ratio", 5.0)
+        meta_out["p_drop"] = getattr(model, "p_drop", 0.3)
+        meta_out["width_cap"] = getattr(model, "width_cap", 64)
         meta_out["proj_mult"] = getattr(model, "proj_mult", 2)
+        
+    else:
+        # Custom model handling
+        mtype = "custom"
+        
+        # Try to infer num_classes from final layer
+        num_classes = None
+        for module in reversed(list(model.modules())):
+            if isinstance(module, nn.Linear):
+                num_classes = module.out_features
+                break
+                
+        if num_classes is None:
+            raise ValueError(
+                "Could not infer num_classes from custom model. "
+                "Ensure your model has a final nn.Linear layer, or provide num_classes in meta."
+            )
+            
+        meta_out: dict = {
+            "model_type": mtype, 
+            "num_classes": num_classes,
+            "custom_model_class": type(model).__name__,
+        }
+        
+        # Try to infer input_dim from first layer
+        input_dim = None
+        for module in model.modules():
+            if isinstance(module, nn.Linear):
+                input_dim = module.in_features
+                break
+                
+        if input_dim is not None:
+            meta_out["input_dim"] = input_dim
+        
+        # Handle reconstruction info
+        if model_factory is not None:
+            import inspect
+            try:
+                # Try to save factory function info
+                meta_out["factory_name"] = model_factory.__name__
+                meta_out["factory_module"] = getattr(model_factory, '__module__', None)
+                meta_out["factory_kwargs"] = model_kwargs or {}
+                
+                # Try to save source if it's a local function
+                try:
+                    source = inspect.getsource(model_factory)
+                    meta_out["factory_source"] = source
+                except (OSError, TypeError):
+                    # Function source not available (e.g., built-in, compiled, etc.)
+                    pass
+                    
+            except Exception as e:
+                warnings.warn(f"Could not serialize model factory: {e}")
+        else:
+            warnings.warn(
+                "Custom model saved without reconstruction info. "
+                "Provide model_factory and model_kwargs to enable loading. "
+                "Loading this model will require manual reconstruction.",
+                UserWarning
+            )
 
+    # Apply user metadata
     if meta:
         meta_out.update(meta)
 
@@ -409,6 +533,52 @@ def _build_from_meta(meta: dict, device: Union[str, torch.device] = "cpu") -> to
             proj_mult=meta.get("proj_mult", 2),
             **common_kwargs,
         )
+    elif mtype == "custom":
+        # Handle custom model reconstruction
+        if "factory_source" in meta:
+            # Try to reconstruct from saved source code
+            try:
+                factory_source = meta["factory_source"]
+                factory_kwargs = meta.get("factory_kwargs", {})
+                
+                # Execute the source code in a clean namespace
+                namespace = {"nn": nn, "torch": torch, "F": torch.nn.functional}
+                exec(factory_source, namespace)
+                
+                # Get the factory function
+                factory_name = meta.get("factory_name", "model_factory")
+                if factory_name not in namespace:
+                    raise ValueError(f"Factory function '{factory_name}' not found in source")
+                    
+                factory_fn = namespace[factory_name]
+                
+                # Try to call with various signatures
+                try:
+                    # First try with all standard parameters
+                    model = factory_fn(
+                        input_dim=meta.get("input_dim"),
+                        num_classes=num_classes,
+                        **factory_kwargs
+                    )
+                except TypeError:
+                    # Fallback to minimal signature
+                    input_dim = meta.get("input_dim")
+                    if input_dim is None:
+                        raise ValueError(
+                            "input_dim not found in metadata. Cannot reconstruct custom model."
+                        )
+                    model = factory_fn(input_dim, num_classes, **factory_kwargs)
+                    
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to reconstruct custom model from source: {e}\n"
+                    f"You may need to manually reconstruct this model."
+                )
+        else:
+            raise ValueError(
+                f"Cannot reconstruct custom model '{meta.get('custom_model_class', 'Unknown')}'. "
+                f"No reconstruction info saved. You need to manually create the model."
+            )
     else:
         raise ValueError(f"Unknown model_type {mtype!r}")
 
@@ -473,7 +643,7 @@ def _ensure_metric(metric: str | MetricFn) -> Tuple[MetricFn | None, str]:
     """
     Return (metric_fn | None, mode).
 
-    * If *metric* is a callable, we assume “higher‑is‑better”.
+    * If *metric* is a callable, we assume "higher‑is‑better".
     * If *metric* == "loss", we signal that we want to **minimise** the
       cross‑entropy returned by `_evaluate()` by returning (None, "min").
     * Otherwise look the metric up in the registry (higher‑is‑better).
@@ -599,7 +769,8 @@ def fit(
     X: Union[pd.DataFrame, np.ndarray],
     y: Union[pd.Series, np.ndarray],
     *,
-    model_type: str = "mlp",
+    model: Union[str, Callable] = "mlp",
+    model_type: str | None = None,  # Deprecated, for backward compatibility
     meta: dict | None = None,
     num_classes: int = 2,
     n_epochs: int = 300,
@@ -613,11 +784,22 @@ def fit(
     early_stopping: bool = True,
     patience: int = 10,
     random_state: int | None = 101,
+    **model_kwargs  # Additional arguments for custom models
 ) -> Tuple[nn.Module, list[dict]]:
     # --------------- setup & data -------------------------------------
     device  = _select_device(device)
     X_np, _ = _to_numpy(X)
     y_np    = np.asarray(y, dtype=int)
+
+    # --------------- backward compatibility ---------------------------
+    if model_type is not None:
+        warnings.warn(
+            "The 'model_type' parameter is deprecated. Use 'model' instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        if model == "mlp":  # Only override if using default
+            model = model_type
 
     # --------------- validation handling ------------------------------
     if validation_data is not None:
@@ -637,17 +819,18 @@ def fit(
     metric_fn, metric_mode = _ensure_metric(metric)
 
     # --------------- model / optimiser / loss -------------------------
-    model = _make_model(
-        model_type,
+    model_instance = _make_model(
+        model,
         input_dim=X_np.shape[1],
         meta=meta,
         num_classes=num_classes,
         n_examples=len(X_np),
+        **model_kwargs
     ).to(device)
 
-    opt     = optim.Adam(model.parameters(), lr=learning_rate)
+    opt     = optim.Adam(model_instance.parameters(), lr=learning_rate)
     ce_loss = nn.CrossEntropyLoss()
-    supcon  = SupConLoss().to(device) if model_type == "cnn" else None
+    supcon  = SupConLoss().to(device) if _should_use_contrastive_loss(model, model_instance) else None
 
     # --------------- dataloader ---------------------------------------
     ds     = torch.utils.data.TensorDataset(
@@ -664,9 +847,9 @@ def fit(
     pbar = tqdm(range(1, n_epochs + 1), desc="Fit", ncols=80)
     for ep in pbar:
         tr_loss = _train_one_epoch(
-            model,
+            model_instance,
             loader,
-            model_type=model_type,
+            model_type=model if isinstance(model, str) else "custom",
             opt=opt,
             ce_loss=ce_loss,
             supcon=supcon,
@@ -679,20 +862,20 @@ def fit(
         if X_val_np is not None:
             if metric == "loss":
                 _, _, val_metric = _evaluate(
-                    model,
+                    model_instance,
                     X_val_np,
                     y_val_np,
-                    model_type=model_type,
+                    model_type=model if isinstance(model, str) else "custom",
                     metric_fn=None,
                     ce_loss=ce_loss,
                     device=device,
                 )
             else:
                 _, val_metric, _ = _evaluate(
-                    model,
+                    model_instance,
                     X_val_np,
                     y_val_np,
-                    model_type=model_type,
+                    model_type=model if isinstance(model, str) else "custom",
                     metric_fn=metric_fn or _macro_roc_auc,
                     ce_loss=None,
                     device=device,
@@ -709,8 +892,8 @@ def fit(
             )
             if improved:
                 best_metric      = val_metric
-                # keep a *CPU* copy so GPU memory isn’t hogged
-                best_state_dict  = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                # keep a *CPU* copy so GPU memory isn't hogged
+                best_state_dict  = {k: v.detach().cpu().clone() for k, v in model_instance.state_dict().items()}
 
         # ---------- early‑stopping check -------------------------------
         if early_stopping and X_val_np is not None and stopper.step(val_metric):
@@ -719,11 +902,11 @@ def fit(
 
     # --------------- restore best weights -----------------------------
     if best_state_dict is not None:
-        model.load_state_dict(best_state_dict)
+        model_instance.load_state_dict(best_state_dict)
         LOGGER.info("Restored best weights (val_metric %.4f).", best_metric)
 
-    model.eval()
-    return model, history
+    model_instance.eval()
+    return model_instance, history
 
 
 # cross‑validation
@@ -732,7 +915,8 @@ def cross_validate(
     X: Union[pd.DataFrame, np.ndarray],
     y: Union[pd.Series, pd.DataFrame, np.ndarray],
     *,
-    model_type: str = "mlp",
+    model: Union[str, Callable] = "mlp",
+    model_type: str | None = None,  # Deprecated, for backward compatibility
     meta: dict | None = None,
     num_classes: int = 2,
     label_col: str | None = None,
@@ -752,6 +936,7 @@ def cross_validate(
     eval_every: int = 1,
     out_dir: str = "artifacts",
     run_name: str | None = None,
+    **model_kwargs  # Additional arguments for custom models
 ) -> Tuple[np.ndarray, dict]:
 
     # ---------- bookkeeping & splits ----------------------------------
@@ -759,6 +944,16 @@ def cross_validate(
         run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
     full_out_dir = os.path.join(out_dir, run_name)
     os.makedirs(full_out_dir, exist_ok=True)
+
+    # ---------- backward compatibility --------------------------------
+    if model_type is not None:
+        warnings.warn(
+            "The 'model_type' parameter is deprecated. Use 'model' instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        if model == "mlp":  # Only override if using default
+            model = model_type
 
     if isinstance(y, pd.DataFrame):
         if label_col is None:
@@ -787,7 +982,7 @@ def cross_validate(
     device  = _select_device(device)
     X_np, _ = _to_numpy(X)
     ce_loss = nn.CrossEntropyLoss()
-    supcon  = SupConLoss().to(device) if model_type == "cnn" else None
+    # We'll determine contrastive loss per fold based on the actual model instance
 
     preds      = np.zeros((len(y_vec), num_classes), np.float32)
     curve_data = []
@@ -816,15 +1011,17 @@ def cross_validate(
         loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
 
         # ---------- model / opt ---------------------------------------
-        model = _make_model(
-            model_type,
+        model_instance = _make_model(
+            model,
             input_dim=X_np.shape[1],
             meta=meta,
             num_classes=num_classes,
             n_examples=len(tr_inner),
+            **model_kwargs
         ).to(device)
-        opt     = optim.Adam(model.parameters(), lr=learning_rate)
+        opt     = optim.Adam(model_instance.parameters(), lr=learning_rate)
         stopper = EarlyStopping(patience=patience, mode=metric_mode)
+        supcon  = SupConLoss().to(device) if _should_use_contrastive_loss(model, model_instance) else None
 
         best_state_dict: dict[str, torch.Tensor] | None = None
         best_metric_fold                     = math.inf if metric_mode == "min" else -math.inf
@@ -834,9 +1031,9 @@ def cross_validate(
         # -------------- epoch loop ------------------------------------
         for ep in range(1, n_epochs + 1):
             _train_one_epoch(
-                model,
+                model_instance,
                 loader,
-                model_type=model_type,
+                model_type=model if isinstance(model, str) else "custom",
                 opt=opt,
                 ce_loss=ce_loss,
                 supcon=supcon,
@@ -849,10 +1046,10 @@ def cross_validate(
                 val_metric = math.nan
                 if va_inner is not None:
                     _, s_val, l_val = _evaluate(
-                        model,
+                        model_instance,
                         X_np[va_inner],
                         y_vec[va_inner],
-                        model_type=model_type,
+                        model_type=model if isinstance(model, str) else "custom",
                         metric_fn=None if metric == "loss" else metric_fn,
                         ce_loss=ce_loss,
                         device=device,
@@ -860,10 +1057,10 @@ def cross_validate(
                     val_metric = l_val if metric == "loss" else s_val
 
                 _, s_tr, l_tr = _evaluate(
-                    model,
+                    model_instance,
                     X_np[tr_inner],
                     y_vec[tr_inner],
-                    model_type=model_type,
+                    model_type=model if isinstance(model, str) else "custom",
                     metric_fn=None if metric == "loss" else metric_fn,
                     ce_loss=ce_loss,
                     device=device,
@@ -886,7 +1083,7 @@ def cross_validate(
                     )
                     if improved:
                         best_metric_fold = val_metric
-                        best_state_dict  = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                        best_state_dict  = {k: v.detach().cpu().clone() for k, v in model_instance.state_dict().items()}
 
                 if fold_early_stop and stopper.step(val_metric):
                     LOGGER.info(
@@ -897,15 +1094,15 @@ def cross_validate(
 
         # -------- restore best weights for this fold ------------------
         if best_state_dict is not None:
-            model.load_state_dict(best_state_dict)
+            model_instance.load_state_dict(best_state_dict)
             LOGGER.info("Fold %d - restored best weights (val %.4f)", fold, best_metric_fold)
 
         # -------- test‑split evaluation -------------------------------
         y_prob_test, s_test, l_test = _evaluate(
-            model,
+            model_instance,
             X_np[te],
             y_vec[te],
-            model_type=model_type,
+            model_type=model if isinstance(model, str) else "custom",
             metric_fn=None if metric == "loss" else metric_fn,
             ce_loss=ce_loss,
             device=device,
@@ -976,6 +1173,7 @@ def predict(
     response_col: str = "answer",
     device: str = "cuda",
     batch_size: int = 4096,
+    output_dir: str | None = None,
 ) -> pd.DataFrame:
     X_df, _ = _read_features(features)
     ids = X_df.index.to_numpy()
@@ -1003,6 +1201,11 @@ def predict(
         pred_cols = {f"prob_class_{c}": probs[:, c] for c in range(num_classes)}
         pred_df = pd.DataFrame({"id": ids, **pred_cols})
 
+    # Handle output directory
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        output_csv = os.path.join(output_dir, os.path.basename(output_csv))
+    
     pred_df.to_csv(output_csv, index=False)
     LOGGER.info("Predictions → %s", output_csv)
 
