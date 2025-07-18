@@ -1,6 +1,6 @@
-# Plug: Embedding Extraction and Modeling Utilities
+# Pingkit: Embedding Extraction and Modeling Utilities
 
-Pattern Learning for Understanding Generation (Plug) is a Python package that turns transformer activations into reproducible, capacity‑aware models. It provides utilities for:
+Probing INternal states of Generative models Kit (pingkit) trains reproducible, capacity‑aware ping models from transformer activations. It provides utilities for:
 
 * Extracting hidden states and embeddings from any Hugging Face `AutoModel`.
 * Aggregating those embeddings into feature matrices or compact `.npz` tensors.
@@ -11,17 +11,23 @@ Pattern Learning for Understanding Generation (Plug) is a Python package
 
 ## Installation
 
-Install directly from GitHub:
+Install most stable version:
 
 ```bash
-pip install git+https://github.com/tatonetti-lab/plug.git
+pip install pingkit
+```
+
+Install latest dev version from GitHub:
+
+```bash
+pip install git+https://github.com/tatonetti-lab/pingkit.git
 ```
 
 Alternatively, clone the repo and install in editable mode:
 
 ```bash
-git clone https://github.com/tatonetti-lab/plug.git
-cd plug
+git clone https://github.com/tatonetti-lab/pingkit.git
+cd ping
 pip install -e .
 ```
 
@@ -37,7 +43,7 @@ For advanced usage including creating custom models and probes, check out the **
 
 Below is a listing of all public functions and classes in each module, along with their parameters and behavior.
 
-### `plug.embedding` Module
+### `pingkit.embedding` Module
 
 #### `load_model_and_tokenizer`
 
@@ -147,7 +153,7 @@ def embed(
 
 ---
 
-### `plug.extraction` Module
+### `pingkit.extraction` Module
 
 #### `extract_token_vectors`
 
@@ -186,7 +192,7 @@ def extract_token_vectors(
 
 ---
 
-### `plug.model` Module
+### `pingkit.model` Module
 
 #### `load_npz_features`
 
@@ -309,15 +315,15 @@ from typing import Tuple
 def save_artifacts(
     model: torch.nn.Module,
     *,
-    path: str = "artifacts/plug",
+    path: str = "artifacts/pingkit",
     meta: dict | None = None,
 ) -> Tuple[str, str]:
 ```
 
-* **Description**: Saves a trained `PlugClassifier` or `PlugContrastiveCNN` to disk: weights (`.pt`) and metadata (`.json`). The metadata includes model geometry (input\_dim, parts, layers, hidden\_size), hyperparameters (`n_examples`, `target_ratio`, `p_drop`, `width_cap`, and `proj_mult` for CNN), plus any additional user‑supplied `meta`.
+* **Description**: Saves a trained `PingClassifier` or `PingContrastiveCNN` to disk: weights (`.pt`) and metadata (`.json`). The metadata includes model geometry (input\_dim, parts, layers, hidden\_size), hyperparameters (`n_examples`, `target_ratio`, `p_drop`, `width_cap`, and `proj_mult` for CNN), plus any additional user‑supplied `meta`.
 * **Parameters**:
 
-  * `model`: Trained PyTorch model instance (`PlugClassifier` or `PlugContrastiveCNN`).
+  * `model`: Trained PyTorch model instance (`PingClassifier` or `PingContrastiveCNN`).
   * `path`: File prefix (without extension) for writing; `.pt` and `.json` are appended.
   * `meta`: Optional extra metadata to include in the JSON.
 * **Returns**: Tuple of absolute paths `(weights_path, meta_path)`.
@@ -370,10 +376,10 @@ def predict(
   * `batch_size`: Batch size for inference.
 * **Returns**: A Pandas DataFrame of predictions with `id` and `prob_*` columns.
 
-#### `PlugClassifier` Class
+#### `PingClassifier` Class
 
 ```python
-class PlugClassifier(nn.Module):
+class PingClassifier(nn.Module):
     def __init__(
         self,
         input_dim: int,
@@ -408,10 +414,10 @@ class PlugClassifier(nn.Module):
   * Passes `x` through `fc1`, `fc2`, adds residual from `res(x)`, then through `out`.
   * Returns raw logits (no softmax).
 
-#### `PlugContrastiveCNN` Class
+#### `PingContrastiveCNN` Class
 
 ```python
-class PlugContrastiveCNN(nn.Module):
+class PingContrastiveCNN(nn.Module):
     def __init__(
         self,
         n_parts: int,
@@ -437,10 +443,10 @@ class PlugContrastiveCNN(nn.Module):
   * `n_layers`: Number of transformer layers in features.
   * `hidden`: Hidden size of parent model (dimension per token embedding).
   * `num_classes`: Output classes.
-  * `n_examples`, `target_ratio`, `width_cap`, `proj_mult`, `p_drop`: Same heuristics as `PlugClassifier`, applied to CNN channel widths.
+  * `n_examples`, `target_ratio`, `width_cap`, `proj_mult`, `p_drop`: Same heuristics as `PingClassifier`, applied to CNN channel widths.
 * **Attributes**:
 
-  * `.encoder`: `PlugCNNEncoder` instance.
+  * `.encoder`: `PingCNNEncoder` instance.
   * `.classifier`: MLP head for final logits.
 * **`forward(flat_x)`**:
 
@@ -479,7 +485,7 @@ Below is a complete example showing how to go from raw text prompts to embedding
 
 ```python
 import pandas as pd
-from plug.embedding import embed_dataset
+from pingkit.embedding import embed_dataset
 
 # Load raw prompts; must have columns ['id', 'prompt']
 df = pd.read_csv('mmlu_prompts_ts.csv', index_col='id')
@@ -533,7 +539,7 @@ embed_dataset(
 ### 3. Aggregate embeddings into a compressed NPZ
 
 ```python
-from plug.extraction import extract_token_vectors
+from pingkit.extraction import extract_token_vectors
 import os
 
 layer = 35
@@ -559,7 +565,7 @@ print("✅   stacked features:", npz_path)
 ### 4. Load features and raw labels
 
 ```python
-from plug.model import load_npz_features
+from pingkit.model import load_npz_features
 import pandas as pd
 
 # Load the NPZ into a DataFrame
@@ -640,7 +646,7 @@ model, history = fit(
 ### 7. Save and reload model artifacts
 
 ```python
-from plug.model import save_artifacts, load_artifacts
+from pingkit.model import save_artifacts, load_artifacts
 
 weights_path, meta_path = save_artifacts(
     model,
@@ -660,7 +666,7 @@ model, meta = load_artifacts(f'artifacts/mmlu_rs_L{layer}', device='cuda')
 ### 8. Evaluate on test set
 
 ```python
-from plug.model import _evaluate
+from pingkit.model import _evaluate
 import numpy as np
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.calibration import calibration_curve
@@ -692,7 +698,7 @@ print(f"ACC {test_acc:.4f}   AUC {auc:.4f}")
 
 ## License
 
-Plug is released under the MIT License. See the [LICENSE](LICENSE) file for details.
+pingkit is released under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 
 ## Contact
