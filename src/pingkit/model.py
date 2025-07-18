@@ -374,6 +374,36 @@ def _should_use_contrastive_loss(model_spec: Union[str, Callable], model: nn.Mod
     return isinstance(model, PlugContrastiveCNN)
 
 
+def _make_class_weight_tensor(
+    class_weight: Union[str, Sequence[float], torch.Tensor, None],
+    y_np: np.ndarray,
+    num_classes: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+
+    if class_weight is None:
+        return None
+
+    if isinstance(class_weight, str):
+        if class_weight not in {"balanced", "auto"}:
+            raise ValueError(f"Unknown class_weight string {class_weight!r}")
+        counts = np.bincount(y_np, minlength=num_classes).astype(float)
+        if (counts == 0).any():
+            raise ValueError(
+                "At least one class has zero frequency; cannot compute balanced weights."
+            )
+        weights = counts.sum() / (counts * num_classes)  # mean(weight)=1
+        return torch.tensor(weights, dtype=torch.float32, device=device)
+
+    # sequence or tensor
+    weights = torch.as_tensor(class_weight, dtype=torch.float32, device=device)
+    if weights.numel() != num_classes:
+        raise ValueError(
+            f"class_weight length ({weights.numel()}) must match num_classes ({num_classes})"
+        )
+    return weights
+
+
 def _forward(model: nn.Module, xb: torch.Tensor, model_type: str) -> Tuple[torch.Tensor, torch.Tensor | None]:
     """Run model and normalise its output to (logits, embedding_opt)."""
     out = model(xb)
@@ -765,12 +795,15 @@ def _make_validation_split(
 
 # fit
 
+# =====================================================================
+# UPDATED fit()
+# =====================================================================
 def fit(
     X: Union[pd.DataFrame, np.ndarray],
     y: Union[pd.Series, np.ndarray],
     *,
     model: Union[str, Callable] = "mlp",
-    model_type: str | None = None,  # Deprecated, for backward compatibility
+    model_type: str | None = None,          # deprecated – kept for BC
     meta: dict | None = None,
     num_classes: int = 2,
     n_epochs: int = 300,
@@ -780,12 +813,24 @@ def fit(
     contrastive_weight: float = 1.0,
     validation_data: Tuple[Union[pd.DataFrame, np.ndarray], np.ndarray] | None = None,
     val_split: float | None = None,
-    metric: str | MetricFn = "roc_auc",
+    eval_metric: str | MetricFn = "roc_auc",
+    metric: str | MetricFn | None = None,   # deprecated alias
     early_stopping: bool = True,
     patience: int = 10,
     random_state: int | None = 101,
-    **model_kwargs  # Additional arguments for custom models
+    class_weight: Union[str, Sequence[float], torch.Tensor, None] = None,
+    loss_fn: Union[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = "ce",
+    **model_kwargs,
 ) -> Tuple[nn.Module, list[dict]]:
+
+    if metric is not None:
+        warnings.warn(
+            "'metric' is deprecated; use 'eval_metric' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        eval_metric = metric
+
     # --------------- setup & data -------------------------------------
     device  = _select_device(device)
     X_np, _ = _to_numpy(X)
@@ -796,9 +841,9 @@ def fit(
         warnings.warn(
             "The 'model_type' parameter is deprecated. Use 'model' instead.",
             DeprecationWarning,
-            stacklevel=2
+            stacklevel=2,
         )
-        if model == "mlp":  # Only override if using default
+        if model == "mlp":          # only override if using default
             model = model_type
 
     # --------------- validation handling ------------------------------
@@ -816,20 +861,50 @@ def fit(
         early_stopping = False            # nothing to monitor
 
     # --------------- metric bootstrap ---------------------------------
-    metric_fn, metric_mode = _ensure_metric(metric)
+    metric_fn, metric_mode = _ensure_metric(eval_metric)
 
-    # --------------- model / optimiser / loss -------------------------
+    # --------------- class weighting ----------------------------------
+    cw_tensor = _make_class_weight_tensor(
+        class_weight, y_np, num_classes, device
+    )
+
+    # --------------- loss function ------------------------------------
+    if callable(loss_fn):
+        ce_loss: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = loss_fn
+    else:
+        lf = loss_fn.lower()
+        if lf == "ce":
+            ce_loss = nn.CrossEntropyLoss(weight=cw_tensor)
+        elif lf == "focal":
+            # minimalist focal example; users can plug their own
+            from torch.nn.functional import cross_entropy
+
+            class _FocalLoss(nn.Module):
+                def __init__(self, gamma: float = 2.0, weight=None):
+                    super().__init__()
+                    self.gamma = gamma
+                    self.register_buffer("weight", weight)
+
+                def forward(self, logits, target):
+                    ce = cross_entropy(logits, target, weight=self.weight, reduction="none")
+                    pt = torch.exp(-ce)
+                    return ((1 - pt) ** self.gamma * ce).mean()
+
+            ce_loss = _FocalLoss(gamma=2.0, weight=cw_tensor)
+        else:
+            raise ValueError(f"Unknown loss_fn {loss_fn!r}")
+
+    # --------------- model / optimiser -------------------------------
     model_instance = _make_model(
         model,
         input_dim=X_np.shape[1],
         meta=meta,
         num_classes=num_classes,
         n_examples=len(X_np),
-        **model_kwargs
+        **model_kwargs,
     ).to(device)
 
     opt     = optim.Adam(model_instance.parameters(), lr=learning_rate)
-    ce_loss = nn.CrossEntropyLoss()
     supcon  = SupConLoss().to(device) if _should_use_contrastive_loss(model, model_instance) else None
 
     # --------------- dataloader ---------------------------------------
@@ -860,7 +935,7 @@ def fit(
         # ---------- compute validation metric --------------------------
         val_metric = math.nan
         if X_val_np is not None:
-            if metric == "loss":
+            if eval_metric == "loss":
                 _, _, val_metric = _evaluate(
                     model_instance,
                     X_val_np,
@@ -884,7 +959,7 @@ def fit(
         history.append({"epoch": ep, "train_loss": tr_loss, "val_metric": val_metric})
         pbar.set_postfix({"train_loss": f"{tr_loss:.4f}", "val_metric": f"{val_metric:.4f}"})
 
-        # ---------- track best model -----------------------------------
+        # ---------- checkpointing -------------------------------------
         if X_val_np is not None and not math.isnan(val_metric):
             improved = (
                 (metric_mode == "max" and val_metric > best_metric) or
@@ -892,10 +967,9 @@ def fit(
             )
             if improved:
                 best_metric      = val_metric
-                # keep a *CPU* copy so GPU memory isn't hogged
                 best_state_dict  = {k: v.detach().cpu().clone() for k, v in model_instance.state_dict().items()}
 
-        # ---------- early‑stopping check -------------------------------
+        # ---------- early‑stopping ------------------------------------
         if early_stopping and X_val_np is not None and stopper.step(val_metric):
             LOGGER.info("Early stopping at epoch %d (best=%.4f)", ep, stopper.best)
             break
@@ -916,7 +990,7 @@ def cross_validate(
     y: Union[pd.Series, pd.DataFrame, np.ndarray],
     *,
     model: Union[str, Callable] = "mlp",
-    model_type: str | None = None,  # Deprecated, for backward compatibility
+    model_type: str | None = None,  # deprecated – kept for BC
     meta: dict | None = None,
     num_classes: int = 2,
     label_col: str | None = None,
@@ -929,15 +1003,28 @@ def cross_validate(
     batch_size: int = 128,
     device: str | torch.device = "cuda",
     contrastive_weight: float = 1.0,
-    metric: str | MetricFn = "roc_auc",
+    eval_metric: str | MetricFn = "roc_auc",
+    metric: str | MetricFn | None = None,   # deprecated alias
     early_stopping: bool = True,
     patience: int = 10,
     random_state: int | None = 101,
     eval_every: int = 1,
     out_dir: str = "artifacts",
     run_name: str | None = None,
-    **model_kwargs  # Additional arguments for custom models
+    class_weight: Union[str, Sequence[float], torch.Tensor, None] = None,
+    loss_fn: Union[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = "ce",
+    # -----------------------------------------------------------------
+    **model_kwargs,
 ) -> Tuple[np.ndarray, dict]:
+
+    # -------- resolve deprecated alias --------------------------------
+    if metric is not None:
+        warnings.warn(
+            "'metric' is deprecated; use 'eval_metric' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        eval_metric = metric
 
     # ---------- bookkeeping & splits ----------------------------------
     if run_name is None:
@@ -950,9 +1037,9 @@ def cross_validate(
         warnings.warn(
             "The 'model_type' parameter is deprecated. Use 'model' instead.",
             DeprecationWarning,
-            stacklevel=2
+            stacklevel=2,
         )
-        if model == "mlp":  # Only override if using default
+        if model == "mlp":
             model = model_type
 
     if isinstance(y, pd.DataFrame):
@@ -976,13 +1063,15 @@ def cross_validate(
     split_gen = list(splitter)
 
     # ---------- metric bootstrap --------------------------------------
-    metric_fn, metric_mode = _ensure_metric(metric)
-    metric_name = metric if isinstance(metric, str) else getattr(metric_fn, "__name__", "metric")
+    metric_fn, metric_mode = _ensure_metric(eval_metric)
+    metric_name = (
+        eval_metric
+        if isinstance(eval_metric, str)
+        else getattr(metric_fn, "__name__", "metric")
+    )
 
     device  = _select_device(device)
     X_np, _ = _to_numpy(X)
-    ce_loss = nn.CrossEntropyLoss()
-    # We'll determine contrastive loss per fold based on the actual model instance
 
     preds      = np.zeros((len(y_vec), num_classes), np.float32)
     curve_data = []
@@ -1010,6 +1099,38 @@ def cross_validate(
         )
         loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
 
+        # ---------- loss function (per‑fold weighting) -----------------
+        device_fold = _select_device(device)
+        ce_weight = _make_class_weight_tensor(
+            class_weight, y_vec[tr_inner], num_classes, device_fold
+        )
+
+        if callable(loss_fn):
+            ce_loss = loss_fn
+        else:
+            lf = loss_fn.lower()
+            if lf == "ce":
+                ce_loss = nn.CrossEntropyLoss(weight=ce_weight)
+            elif lf == "focal":
+                from torch.nn.functional import cross_entropy
+
+                class _FocalLoss(nn.Module):
+                    def __init__(self, gamma: float = 2.0, weight=None):
+                        super().__init__()
+                        self.gamma = gamma
+                        self.register_buffer("weight", weight)
+
+                    def forward(self, logits, target):
+                        ce = cross_entropy(
+                            logits, target, weight=self.weight, reduction="none"
+                        )
+                        pt = torch.exp(-ce)
+                        return ((1 - pt) ** self.gamma * ce).mean()
+
+                ce_loss = _FocalLoss(gamma=2.0, weight=ce_weight)
+            else:
+                raise ValueError(f"Unknown loss_fn {loss_fn!r}")
+
         # ---------- model / opt ---------------------------------------
         model_instance = _make_model(
             model,
@@ -1017,11 +1138,12 @@ def cross_validate(
             meta=meta,
             num_classes=num_classes,
             n_examples=len(tr_inner),
-            **model_kwargs
-        ).to(device)
+            **model_kwargs,
+        ).to(device_fold)
+
         opt     = optim.Adam(model_instance.parameters(), lr=learning_rate)
         stopper = EarlyStopping(patience=patience, mode=metric_mode)
-        supcon  = SupConLoss().to(device) if _should_use_contrastive_loss(model, model_instance) else None
+        supcon  = SupConLoss().to(device_fold) if _should_use_contrastive_loss(model, model_instance) else None
 
         best_state_dict: dict[str, torch.Tensor] | None = None
         best_metric_fold                     = math.inf if metric_mode == "min" else -math.inf
@@ -1038,7 +1160,7 @@ def cross_validate(
                 ce_loss=ce_loss,
                 supcon=supcon,
                 contrastive_weight=contrastive_weight,
-                device=device,
+                device=device_fold,
             )
 
             if ep % eval_every == 0 or ep == n_epochs:
@@ -1050,22 +1172,22 @@ def cross_validate(
                         X_np[va_inner],
                         y_vec[va_inner],
                         model_type=model if isinstance(model, str) else "custom",
-                        metric_fn=None if metric == "loss" else metric_fn,
+                        metric_fn=None if eval_metric == "loss" else metric_fn,
                         ce_loss=ce_loss,
-                        device=device,
+                        device=device_fold,
                     )
-                    val_metric = l_val if metric == "loss" else s_val
+                    val_metric = l_val if eval_metric == "loss" else s_val
 
                 _, s_tr, l_tr = _evaluate(
                     model_instance,
                     X_np[tr_inner],
                     y_vec[tr_inner],
                     model_type=model if isinstance(model, str) else "custom",
-                    metric_fn=None if metric == "loss" else metric_fn,
+                    metric_fn=None if eval_metric == "loss" else metric_fn,
                     ce_loss=ce_loss,
-                    device=device,
+                    device=device_fold,
                 )
-                train_metric = l_tr if metric == "loss" else s_tr
+                train_metric = l_tr if eval_metric == "loss" else s_tr
 
                 LOGGER.info(
                     "Fold %d ep %3d | train_%s %.4f val_%s %.4f",
@@ -1075,7 +1197,7 @@ def cross_validate(
                 epochs_seen.append(ep)
                 metrics_seen.append(val_metric)
 
-                # -------- track best model for this fold --------------
+                # -------- best model for this fold --------------------
                 if va_inner is not None and not math.isnan(val_metric):
                     improved = (
                         (metric_mode == "max" and val_metric > best_metric_fold) or
@@ -1103,11 +1225,11 @@ def cross_validate(
             X_np[te],
             y_vec[te],
             model_type=model if isinstance(model, str) else "custom",
-            metric_fn=None if metric == "loss" else metric_fn,
+            metric_fn=None if eval_metric == "loss" else metric_fn,
             ce_loss=ce_loss,
-            device=device,
+            device=device_fold,
         )
-        fold_metric_val = l_test if metric == "loss" else s_test
+        fold_metric_val = l_test if eval_metric == "loss" else s_test
         preds[te] = y_prob_test
 
         curve_data.append({"fold": fold, "epochs": epochs_seen, "metrics": metrics_seen})
@@ -1116,8 +1238,10 @@ def cross_validate(
         LOGGER.info("Fold %d finished - %s %.4f", fold, metric_name, fold_metric_val)
 
     # ---------- aggregate results -------------------------------------
-    if metric == "loss":
-        overall_metric = ce_loss(torch.tensor(preds), torch.tensor(y_vec)).item()
+    if eval_metric == "loss":
+        overall_metric = nn.CrossEntropyLoss()(
+            torch.tensor(preds), torch.tensor(y_vec)
+        ).item()
     else:
         overall_metric = metric_fn(y_vec, preds)
 
@@ -1130,7 +1254,7 @@ def cross_validate(
         "folds": fold_stats,
     }
 
-    # ---------- curve plotting / JSON dump (unchanged) ----------------
+    # ---------- curve plotting  ----------------------------
     if curve_data and any(cd["metrics"] for cd in curve_data):
         plt.figure()
         vmin = min(min(cd["metrics"]) for cd in curve_data if cd["metrics"])
