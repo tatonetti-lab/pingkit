@@ -1,6 +1,6 @@
 # Pingkit: Embedding Extraction and Modeling Utilities
 
-Probing INternal states of Generative models Kit (pingkit) trains reproducible, capacity‑aware ping models from transformer activations. It provides utilities for:
+**P**robing **IN**ternal states of **G**enerative models Kit (pingkit) trains reproducible, capacity‑aware ping models from transformer activations. It provides utilities for:
 
 * Extracting hidden states and embeddings from any Hugging Face `AutoModel`.
 * Aggregating those embeddings into feature matrices or compact `.npz` tensors.
