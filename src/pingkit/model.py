@@ -33,8 +33,8 @@ plt.switch_backend("Agg")  # headless‑safe
 
 LOGGER = logging.getLogger(__name__)
 __all__ = [
-    "PlugClassifier",
-    "PlugContrastiveCNN",
+    "PingClassifier",
+    "PingContrastiveCNN",
     "fit",
     "cross_validate",
     "save_artifacts",
@@ -61,7 +61,7 @@ def _json_encode(obj):
 
 # model definitions
 
-class PlugClassifier(nn.Module):
+class pingClassifier(nn.Module):
     """Width‑scaling MLP for tabular data."""
 
     def __init__(
@@ -105,7 +105,7 @@ class PlugClassifier(nn.Module):
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         LOGGER.info(
-            "PlugClassifier • d=%d N=%s target=%.1f ⇒ fc1=%d params=%d (≈%.1f×N)",
+            "pingClassifier • d=%d N=%s target=%.1f ⇒ fc1=%d params=%d (≈%.1f×N)",
             input_dim,
             n_examples,
             target_ratio,
@@ -121,7 +121,7 @@ class PlugClassifier(nn.Module):
         return self.out(x)  # logits
 
 
-class PlugCNNEncoder(nn.Module):
+class pingCNNEncoder(nn.Module):
     """Capacity‑aware CNN encoder for 1‑D or grid‑like inputs."""
 
     def __init__(
@@ -183,7 +183,7 @@ class PlugCNNEncoder(nn.Module):
         return self.backbone(x)
 
 
-class PlugContrastiveCNN(nn.Module):
+class pingContrastiveCNN(nn.Module):
     """CNN encoder + MLP head tuned for supervised contrastive training."""
 
     def __init__(
@@ -210,7 +210,7 @@ class PlugContrastiveCNN(nn.Module):
         self.n_layers = n_layers
         self.hidden = hidden
 
-        self.encoder = PlugCNNEncoder(
+        self.encoder = pingCNNEncoder(
             n_parts,
             n_layers,
             hidden,
@@ -233,7 +233,7 @@ class PlugContrastiveCNN(nn.Module):
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         LOGGER.info(
-            "PlugContrastiveCNN • classes=%d params=%d (≈%.1f×N)",
+            "pingContrastiveCNN • classes=%d params=%d (≈%.1f×N)",
             num_classes,
             n_params,
             n_params / (n_examples or 1),
@@ -319,7 +319,7 @@ def _make_model(
     if isinstance(model_spec, str):
         # Built-in models
         if model_spec == "mlp":
-            return PlugClassifier(
+            return pingClassifier(
                 input_dim,
                 num_classes,
                 n_examples=n_examples,
@@ -329,7 +329,7 @@ def _make_model(
         elif model_spec == "cnn":
             if meta is None:
                 raise ValueError("meta required for CNN.")
-            return PlugContrastiveCNN(
+            return pingContrastiveCNN(
                 len(meta["parts"]),
                 len(meta["layers"]),
                 meta["hidden_size"],
@@ -370,8 +370,8 @@ def _should_use_contrastive_loss(model_spec: Union[str, Callable], model: nn.Mod
     """Determine if the model should use contrastive loss."""
     if isinstance(model_spec, str):
         return model_spec == "cnn"
-    # For custom models, check if it's a PlugContrastiveCNN or returns tuples
-    return isinstance(model, PlugContrastiveCNN)
+    # For custom models, check if it's a pingContrastiveCNN or returns tuples
+    return isinstance(model, pingContrastiveCNN)
 
 
 def _make_class_weight_tensor(
@@ -424,7 +424,7 @@ def _path_prefix(path: str) -> str:
 def save_artifacts(
     model: torch.nn.Module,
     *,
-    path: str = "artifacts/plug",
+    path: str = "artifacts/ping",
     meta: dict | None = None,
     model_factory: Callable | None = None,  # NEW: reconstruction function
     model_kwargs: dict | None = None,       # NEW: factory arguments
@@ -443,7 +443,7 @@ def save_artifacts(
     prefix = _path_prefix(path)
     os.makedirs(os.path.dirname(prefix) or ".", exist_ok=True)
 
-    if isinstance(model, PlugClassifier):
+    if isinstance(model, pingClassifier):
         mtype = "mlp"
         num_classes = model.out[-1].out_features
         meta_out: dict = {"model_type": mtype, "num_classes": num_classes}
@@ -453,7 +453,7 @@ def save_artifacts(
         meta_out["p_drop"] = getattr(model, "p_drop", 0.3)
         meta_out["width_cap"] = getattr(model, "width_cap", 128)
         
-    elif isinstance(model, PlugContrastiveCNN):
+    elif isinstance(model, pingContrastiveCNN):
         mtype = "cnn"
         num_classes = model.classifier[-1].out_features
         meta_out: dict = {"model_type": mtype, "num_classes": num_classes}
@@ -553,9 +553,9 @@ def _build_from_meta(meta: dict, device: Union[str, torch.device] = "cpu") -> to
 
     mtype = meta.get("model_type", "mlp")
     if mtype == "mlp":
-        model = PlugClassifier(int(meta["input_dim"]), num_classes, **common_kwargs)
+        model = pingClassifier(int(meta["input_dim"]), num_classes, **common_kwargs)
     elif mtype == "cnn":
-        model = PlugContrastiveCNN(
+        model = pingContrastiveCNN(
             len(meta["parts"]),
             len(meta["layers"]),
             meta["hidden_size"],

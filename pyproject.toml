@@ -1,15 +1,20 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = [
+  "setuptools>=77.0.0",   # first release that bumps metadata to 2.4
+  "wheel",
+  "build"
+]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "plug"
-version = "0.3.0"
+name = "pingkit"
+version = "0.4.2"
 description = "LLM classification toolkit"
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }  #
-authors = [{ name = "Your Name", email = "jacob.berkowitz2@cshs.org" }] 
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jacob Berkowitz", email = "jacob.berkowitz2@cshs.org" }]
 
 dependencies = [
   "torch>=2.2",
@@ -26,13 +31,22 @@ dependencies = [
 ]
 
 [project.scripts]
-plug = "plug.cli:app"
+pingkit = "pingkit.cli:app"
+# plug  = "pingkit.cli:app"
 
+
+# ──────────────────────────
+#  Setuptools configuration
+# ──────────────────────────
 [tool.setuptools]
-packages = ["plug"]
+package-dir = {"" = "src"}
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-data]
-plug = ["*.json", "*.txt", "*.yaml"]
+pingkit = ["*.json", "*.txt", "*.yaml"]
 
-[tool.setuptools.exclude-package-data]
-
+[tool.setuptools.exclude-package-data]       # keep notebooks & .ipynb out of wheels
+"*" = ["*.ipynb", "notebooks/*", "examples/*"]
