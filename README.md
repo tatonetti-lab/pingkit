@@ -1,6 +1,6 @@
-# Plug: Embedding Extraction and Modeling Utilities
+# Pingkit: Embedding Extraction and Modeling Utilities
 
-Pattern Learning for Understanding Generation (Plug) is a Python package that turns transformer activations into reproducible, capacity‑aware models. It provides utilities for:
+**P**robing **IN**ternal states of **G**enerative models Kit (pingkit) trains reproducible, capacity‑aware ping models from transformer activations. It provides utilities for:
 
 * Extracting hidden states and embeddings from any Hugging Face `AutoModel`.
 * Aggregating those embeddings into feature matrices or compact `.npz` tensors.
@@ -11,17 +11,23 @@ Pattern Learning for Understanding Generation (Plug) is a Python package
 
 ## Installation
 
-Install directly from GitHub:
+Install most stable version:
 
 ```bash
-pip install git+https://github.com/tatonetti-lab/plug.git
+pip install pingkit
+```
+
+Install latest dev version from GitHub:
+
+```bash
+pip install git+https://github.com/tatonetti-lab/pingkit.git
 ```
 
 Alternatively, clone the repo and install in editable mode:
 
 ```bash
-git clone https://github.com/tatonetti-lab/plug.git
-cd plug
+git clone https://github.com/tatonetti-lab/pingkit.git
+cd ping
 pip install -e .
 ```
 
@@ -37,7 +43,7 @@ For advanced usage including creating custom models and probes, check out the **
 
 Below is a listing of all public functions and classes in each module, along with their parameters and behavior.
 
-### `plug.embedding` Module
+### `pingkit.embedding` Module
 
 #### `load_model_and_tokenizer`
 
@@ -147,7 +153,7 @@ def embed(
 
 ---
 
-### `plug.extraction` Module
+### `pingkit.extraction` Module
 
 #### `extract_token_vectors`
 
@@ -186,7 +192,7 @@ def extract_token_vectors(
 
 ---
 
-### `plug.model` Module
+### `pingkit.model` Module
 
 #### `load_npz_features`
 
@@ -212,7 +218,7 @@ def fit(
     X: Union[pd.DataFrame, np.ndarray],
     y: Union[pd.Series, np.ndarray],
     *,
-    model_type: str = "mlp",
+    model: str = "mlp",
     meta: dict | None = None,
     num_classes: int = 2,
     n_epochs: int = 300,
@@ -234,7 +240,7 @@ def fit(
 
   * `X`: Feature matrix (DataFrame or NumPy) of shape `(n_samples, n_features)`.
   * `y`: Labels (Series or 1D array) of shape `(n_samples,)`.
-  * `model_type`: `"mlp"` or `"cnn"`. If `"cnn"`, `meta` must be provided to reconstruct CNN input shape.
+  * `model` (str or callable): Specifies the model to use. Built-in options include `"mlp"` and `"cnn"`. Alternatively, provide a callable to define custom models. If `"cnn"` or a custom CNN is used, `meta` must provided to reconstruct the input shape.
   * `meta`: Metadata dict (from `load_npz_features`) containing `"parts"`, `"layers"`, `"hidden_size"` (required if `model_type="cnn"`).
   * `num_classes`: Number of output classes.
   * `n_epochs`: Maximum number of epochs to train.
@@ -244,7 +250,9 @@ def fit(
   * `contrastive_weight`: Weight λ for supervised contrastive loss (only used if `model_type="cnn"`).
   * `validation_data`: Tuple `(X_val, y_val)`. If provided, uses this as hold‑out validation set.
   * `val_split`: Fraction of data to set aside for validation (if `validation_data` is None).
-  * `metric`: Either a registered metric name (`"roc_auc"`, `"accuracy"`, `"macro_f1"`) or a callable `metric(y_true, y_prob)`.
+  * `eval_metric`: Either a registered metric name ("roc_auc", "accuracy", "macro_f1", "loss") or a callable metric(y_true, y_prob). Default is `"roc_auc"`.
+  * `class_weight` (str, sequence of floats, tensor, or None): Class weighting strategy ("balanced" or explicit class weights).
+  * `loss_fn` (str or callable): Loss function to optimize, either `"ce"` (cross-entropy, default), `"focal"`, or a custom callable.
   * `early_stopping`: If True, enable early stopping on validation metric.
   * `patience`: Number of epochs with no improvement before stopping.
   * `random_state`: Seed for reproducibility (controls data shuffling).
@@ -253,53 +261,10 @@ def fit(
   * `model`: Trained `nn.Module` (in eval mode).
   * `history`: List of dicts, each with keys `"epoch"`, `"train_loss"`, and `"val_metric"`.
 
-#### `cross_validate`
+> ⚠️ **Deprecation Notice:**
 
-```python
-from typing import Union, Tuple, Any, List, Dict
-
-def cross_validate(
-    X: Union[pd.DataFrame, np.ndarray],
-    y: Union[pd.Series, pd.DataFrame, np.ndarray],
-    *,
-    model_type: str = "mlp",
-    meta: dict | None = None,
-    num_classes: int = 2,
-    label_col: str | None = None,
-    splitter: Iterable[Tuple[np.ndarray, np.ndarray]] | None = None,
-    n_splits: int = 5,
-    groups: Union[pd.Series, np.ndarray, None] = None,
-    inner_val_split: float | None = 0.15,
-    n_epochs: int = 100,
-    learning_rate: float = 1e-3,
-    batch_size: int = 128,
-    device: str | torch.device = "cuda",
-    contrastive_weight: float = 1.0,
-    metric: str | Callable[[np.ndarray, np.ndarray], float] = "roc_auc",
-    early_stopping: bool = True,
-    patience: int = 10,
-    random_state: int | None = 101,
-    eval_every: int = 1,
-    out_dir: str = "artifacts",
-    run_name: str | None = None,
-) -> Tuple[np.ndarray, dict]:
-```
-
-* **Description**: Performs cross‑validation training and evaluation. Splits data into `n_splits` (using `StratifiedKFold` or `LeaveOneGroupOut` if `groups` provided), optionally with inner validation splits. Trains per fold, logs metrics and learning curves, saves artifacts under `out_dir/<run_name>/`.
-* **Parameters**: Similar to `fit`, plus:
-
-  * `label_col`: If `y` is a DataFrame, column name for labels.
-  * `splitter`: Custom sequence of `(train_idx, test_idx)` splits.
-  * `n_splits`: Number of outer folds (ignored if `splitter` provided).
-  * `groups`: Group labels for leave‑one‑group‑out splitting.
-  * `inner_val_split`: Fraction of each training fold to use for validation.
-  * `eval_every`: Evaluate metrics every `eval_every` epochs.
-  * `out_dir`: Parent directory to save fold‑level artifacts (JSON summary + learning curve PNG).
-  * `run_name`: Subdirectory name for this run; defaults to timestamp.
-* **Returns**: `(preds, cv_summary)`:
-
-  * `preds`: NumPy array `(n_samples, num_classes)` of predicted probabilities.
-  * `cv_summary`: Dict containing overall metric, per‑fold stats, elapsed time, and learning curve PNG path.
+  * The parameter `model_type` is deprecated. Use `model` instead.
+  * The parameter `metric` is deprecated. Use `eval_metric` instead.
 
 #### `save_artifacts`
 
@@ -309,15 +274,15 @@ from typing import Tuple
 def save_artifacts(
     model: torch.nn.Module,
     *,
-    path: str = "artifacts/plug",
+    path: str = "artifacts/pingkit",
     meta: dict | None = None,
 ) -> Tuple[str, str]:
 ```
 
-* **Description**: Saves a trained `PlugClassifier` or `PlugContrastiveCNN` to disk: weights (`.pt`) and metadata (`.json`). The metadata includes model geometry (input\_dim, parts, layers, hidden\_size), hyperparameters (`n_examples`, `target_ratio`, `p_drop`, `width_cap`, and `proj_mult` for CNN), plus any additional user‑supplied `meta`.
+* **Description**: Saves a trained `pingClassifier`, `pingContrastiveCNN` or custom model to disk: weights (`.pt`) and metadata (`.json`). The metadata includes model geometry (input\_dim, parts, layers, hidden\_size), hyperparameters (`n_examples`, `target_ratio`, `p_drop`, `width_cap`, and `proj_mult` for CNN), plus any additional user‑supplied `meta`.
 * **Parameters**:
 
-  * `model`: Trained PyTorch model instance (`PlugClassifier` or `PlugContrastiveCNN`).
+  * `model`: Trained PyTorch model instance (`pingClassifier` or `pingContrastiveCNN`).
   * `path`: File prefix (without extension) for writing; `.pt` and `.json` are appended.
   * `meta`: Optional extra metadata to include in the JSON.
 * **Returns**: Tuple of absolute paths `(weights_path, meta_path)`.
@@ -370,10 +335,10 @@ def predict(
   * `batch_size`: Batch size for inference.
 * **Returns**: A Pandas DataFrame of predictions with `id` and `prob_*` columns.
 
-#### `PlugClassifier` Class
+#### `pingClassifier` Class
 
 ```python
-class PlugClassifier(nn.Module):
+class pingClassifier(nn.Module):
     def __init__(
         self,
         input_dim: int,
@@ -408,10 +373,10 @@ class PlugClassifier(nn.Module):
   * Passes `x` through `fc1`, `fc2`, adds residual from `res(x)`, then through `out`.
   * Returns raw logits (no softmax).
 
-#### `PlugContrastiveCNN` Class
+#### `pingContrastiveCNN` Class
 
 ```python
-class PlugContrastiveCNN(nn.Module):
+class pingContrastiveCNN(nn.Module):
     def __init__(
         self,
         n_parts: int,
@@ -437,10 +402,10 @@ class PlugContrastiveCNN(nn.Module):
   * `n_layers`: Number of transformer layers in features.
   * `hidden`: Hidden size of parent model (dimension per token embedding).
   * `num_classes`: Output classes.
-  * `n_examples`, `target_ratio`, `width_cap`, `proj_mult`, `p_drop`: Same heuristics as `PlugClassifier`, applied to CNN channel widths.
+  * `n_examples`, `target_ratio`, `width_cap`, `proj_mult`, `p_drop`: Same heuristics as `pingClassifier`, applied to CNN channel widths.
 * **Attributes**:
 
-  * `.encoder`: `PlugCNNEncoder` instance.
+  * `.encoder`: `pingCNNEncoder` instance.
   * `.classifier`: MLP head for final logits.
 * **`forward(flat_x)`**:
 
@@ -479,7 +444,7 @@ Below is a complete example showing how to go from raw text prompts to embedding
 
 ```python
 import pandas as pd
-from plug.embedding import embed_dataset
+from pingkit.embedding import embed_dataset
 
 # Load raw prompts; must have columns ['id', 'prompt']
 df = pd.read_csv('mmlu_prompts_ts.csv', index_col='id')
@@ -533,7 +498,7 @@ embed_dataset(
 ### 3. Aggregate embeddings into a compressed NPZ
 
 ```python
-from plug.extraction import extract_token_vectors
+from pingkit.extraction import extract_token_vectors
 import os
 
 layer = 35
@@ -559,7 +524,7 @@ print("✅   stacked features:", npz_path)
 ### 4. Load features and raw labels
 
 ```python
-from plug.model import load_npz_features
+from pingkit.model import load_npz_features
 import pandas as pd
 
 # Load the NPZ into a DataFrame
@@ -640,7 +605,7 @@ model, history = fit(
 ### 7. Save and reload model artifacts
 
 ```python
-from plug.model import save_artifacts, load_artifacts
+from pingkit.model import save_artifacts, load_artifacts
 
 weights_path, meta_path = save_artifacts(
     model,
@@ -660,7 +625,7 @@ model, meta = load_artifacts(f'artifacts/mmlu_rs_L{layer}', device='cuda')
 ### 8. Evaluate on test set
 
 ```python
-from plug.model import _evaluate
+from pingkit.model import _evaluate
 import numpy as np
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.calibration import calibration_curve
@@ -692,7 +657,7 @@ print(f"ACC {test_acc:.4f}   AUC {auc:.4f}")
 
 ## License
 
-Plug is released under the MIT License. See the [LICENSE](LICENSE) file for details.
+pingkit is released under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 
 ## Contact
