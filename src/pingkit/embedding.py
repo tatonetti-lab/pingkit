@@ -64,7 +64,7 @@ def _get_attn_and_mlp(block: torch.nn.Module):
 # load
 
 def load_model_and_tokenizer(
-    model_name: str = "google/gemma-2b-it",
+    model_name: str = "Qwen/Qwen3-0.6B",
     *,
     quantization: str | None = None,
     device_map: str | None = "auto",   # keep "auto" so big models shard
@@ -166,7 +166,7 @@ def embed_dataset(
     data: Union[pd.DataFrame, str, Iterable[str]],
     *,
     input_col: str | None = None,
-    model_name: str = "google/gemma-2b-it",
+    model_name: str = "Qwen/Qwen3-0.6B",
     output_dir: str = "embeddings",
     layers: List[int] | None = None,
     parts: List[str] | None = None,
@@ -258,7 +258,7 @@ def embed_dataset(
 def embed(
     inputs: Union[str, List[str]],
     *,
-    model_name: str = "google/gemma-2b-it",
+    model_name: str = "Qwen/Qwen3-0.6B",
     layers: List[int] | None = None,
     parts: List[str] | None = None,
     pooling: Union[str, List[str]] = "last",

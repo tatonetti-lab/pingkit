@@ -1,7 +1,6 @@
 LICENSE
 README.md
 pyproject.toml
-setup.py
 src/pingkit/__init__.py
 src/pingkit/embedding.py
 src/pingkit/extraction.py
