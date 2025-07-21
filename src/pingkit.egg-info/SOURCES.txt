@@ -1,0 +1,14 @@
+LICENSE
+README.md
+pyproject.toml
+setup.py
+src/pingkit/__init__.py
+src/pingkit/embedding.py
+src/pingkit/extraction.py
+src/pingkit/model.py
+src/pingkit.egg-info/PKG-INFO
+src/pingkit.egg-info/SOURCES.txt
+src/pingkit.egg-info/dependency_links.txt
+src/pingkit.egg-info/entry_points.txt
+src/pingkit.egg-info/requires.txt
+src/pingkit.egg-info/top_level.txt

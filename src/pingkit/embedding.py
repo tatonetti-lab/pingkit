@@ -212,7 +212,7 @@ def embed_dataset(
             with torch.no_grad():
                 out = model(**enc, output_hidden_states=True)
 
-            tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze())
+            tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"][0].tolist())
 
             if filter_non_text:
                 # filtering behavior
@@ -296,7 +296,7 @@ def embed(
             with torch.no_grad():
                 out = model(**enc, output_hidden_states=True)
 
-            tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze())
+            tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"][0].tolist())
 
             if filter_non_text:
                 valid_idxs = [
