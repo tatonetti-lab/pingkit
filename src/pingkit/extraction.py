@@ -28,7 +28,16 @@ def _discover_basic_dims(embed_dir: str, part: str) -> Tuple[int, int, List[str]
 
 
 def _read_vector(path: str) -> np.ndarray:
-    return np.loadtxt(path, delimiter=",", skiprows=1, dtype=np.float32)
+    # Read with pandas, coerce to numeric, keep the last numeric column by default
+    df = pd.read_csv(path, engine="python")
+    # Try to pick numeric columns; if none are numeric yet, coerce
+    num = df.select_dtypes(include=[np.number])
+    if num.empty:
+        num = df.apply(pd.to_numeric, errors="coerce")
+    # Heuristic: take the last numeric column as the vector values
+    vec = num.iloc[:, -1]
+    return vec.to_numpy(dtype=np.float32)
+
 
 
 def _process_qid(qid: str, embed_dir: str, parts: Sequence[str],
