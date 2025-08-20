@@ -27,16 +27,47 @@ def _discover_basic_dims(embed_dir: str, part: str) -> Tuple[int, int, List[str]
     return n_layers, hidden_size, qids
 
 
-def _read_vector(path: str) -> np.ndarray:
-    # Read with pandas, coerce to numeric, keep the last numeric column by default
-    df = pd.read_csv(path, engine="python")
-    # Try to pick numeric columns; if none are numeric yet, coerce
+def _read_vector(path: str, expected_len: int) -> np.ndarray:
+    """
+    Read a single embedding vector from CSV and return a 1-D float32 array
+    of length == expected_len. If the file is empty or malformed, return a
+    NaN-filled array of that length.
+    """
+    try:
+        df = pd.read_csv(path, engine="python")
+    except Exception as e:
+        LOGGER.warning("Failed to read %s (%s). Filling with NaNs.", path, e)
+        return np.full(expected_len, np.nan, dtype=np.float32)
+
+    if df.empty:
+        LOGGER.warning("Empty CSV: %s. Filling with NaNs.", path)
+        return np.full(expected_len, np.nan, dtype=np.float32)
+
+    # Prefer already-numeric columns; otherwise coerce all to numeric
     num = df.select_dtypes(include=[np.number])
     if num.empty:
         num = df.apply(pd.to_numeric, errors="coerce")
-    # Heuristic: take the last numeric column as the vector values
-    vec = num.iloc[:, -1]
-    return vec.to_numpy(dtype=np.float32)
+
+    # Heuristic: take the last numeric column as the embedding values
+    # (adjust if you know the exact column name/index)
+    try:
+        s = num.iloc[:, -1]
+    except Exception:
+        LOGGER.warning("No numeric columns found in %s. Filling with NaNs.", path)
+        return np.full(expected_len, np.nan, dtype=np.float32)
+
+    vec = s.to_numpy(dtype=np.float32, copy=False)
+
+    # Enforce expected length: pad/truncate with NaNs to avoid downstream crashes
+    if vec.size < expected_len:
+        vec = np.pad(vec, (0, expected_len - vec.size), constant_values=np.nan)
+        LOGGER.warning("Padded %s from %d to %d with NaNs.", path, vec.size, expected_len)
+    elif vec.size > expected_len:
+        LOGGER.warning("Truncated %s from %d to %d.", path, vec.size, expected_len)
+        vec = vec[:expected_len]
+
+    return vec
+
 
 
 
@@ -48,11 +79,13 @@ def _process_qid(qid: str, embed_dir: str, parts: Sequence[str],
             fname = f"{qid}_L{layer:02d}.csv"
             path = os.path.join(embed_dir, part, fname)
             if os.path.isfile(path):
-                vecs.append(_read_vector(path))
+                v = _read_vector(path, expected_len=hidden_size)
+                vecs.append(v)
             else:
                 LOGGER.warning("Missing embedding file: %s (filled with NaNs)", path)
                 vecs.append(np.full(hidden_size, np.nan, dtype=np.float32))
     return qid, np.concatenate(vecs, axis=0)
+
 
 
 # public
@@ -89,6 +122,14 @@ def extract_token_vectors(
     )
     data: Dict[str, np.ndarray] = dict(results)
 
+    for qid, arr in data.items():
+        if arr.size != hidden_size * len(parts) * len(layers):
+            LOGGER.warning(
+                "Vector size mismatch for %s: got %d, expected %d",
+                qid, arr.size, hidden_size * len(parts) * len(layers)
+            )
+
+    
     # each col is a sample id, row-index is feature
     feature_count = hidden_size * len(parts) * len(layers)
     df = pd.DataFrame(data, index=range(feature_count), dtype=np.float32)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, re, logging
-from typing import Iterable, Union, Dict, List
+from typing import Iterable, Union, Dict, List, Tuple
 import numpy as np
 import torch, pandas as pd
 from tqdm import tqdm
@@ -9,8 +9,15 @@ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 LOGGER = logging.getLogger(__name__)
 __all__ = ["load_model_and_tokenizer", "embed_dataset", "embed"]
 
+# try PEFT lazily so base use still works without the dependency
+try:
+    from peft import PeftModel
+    _PEFT_AVAILABLE = True
+except Exception:
+    PeftModel = None  # type: ignore
+    _PEFT_AVAILABLE = False
+
 # skip pure punctuation/symbol tokens
-# this is for the pooling function in case user wants to drop potentially irrelevant tokens
 _SKIP_PUNCT_RE = re.compile(r"^[^A-Za-z0-9]+$")
 # skip pandas duplicate columns: optional non-alnum → dot → digits
 _SKIP_DUP_RE   = re.compile(r"^[^A-Za-z0-9]*\.[0-9]+$")
@@ -18,11 +25,28 @@ _SKIP_DUP_RE   = re.compile(r"^[^A-Za-z0-9]*\.[0-9]+$")
 
 # helpers
 
+def _is_peft_model(m: torch.nn.Module) -> bool:
+    """Return True if m looks like a PEFT-wrapped model."""
+    return _PEFT_AVAILABLE and isinstance(m, PeftModel)  # type: ignore
+
+
 def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
-    """Return underlying model if wrapped in DataParallel/DDP."""
+    """
+    Return the underlying base model if wrapped in DataParallel/DDP/PEFT.
+    """
+    # DataParallel/DDP first
     if isinstance(model, (torch.nn.DataParallel,
                           torch.nn.parallel.DistributedDataParallel)):
-        return model.module
+        model = model.module
+
+    # Unwrap PEFT to the base HF model
+    if _is_peft_model(model):
+        get_base = getattr(model, "get_base_model", None)
+        if callable(get_base):
+            model = get_base()
+        elif hasattr(model, "base_model"):
+            model = model.base_model  # type: ignore
+
     return model
 
 
@@ -37,20 +61,25 @@ def _primary_device(model: torch.nn.Module) -> torch.device:
 
 
 def _get_blocks(model: torch.nn.Module):
-    """Locate transformer blocks in many HF architectures."""
+    """
+    Locate transformer blocks across common HF architectures.
+    Works whether the incoming model is PEFT-wrapped or not.
+    """
     m = _unwrap(model)
     if hasattr(m, "layers"):
         return m.layers
     if hasattr(m, "model") and hasattr(m.model, "layers"):
         return m.model.layers
+    if hasattr(m, "gpt_neox") and hasattr(m.gpt_neox, "layers"):
+        return m.gpt_neox.layers
     if hasattr(m, "encoder") and hasattr(m.encoder, "layer"):
         return m.encoder.layer
     if hasattr(m, "decoder") and hasattr(m.decoder, "layers"):
         return m.decoder.layers
-    raise AttributeError("Cannot locate transformer layers.")
+    raise AttributeError("Cannot locate transformer layers on the (unwrapped) model.")
 
 
-def _get_attn_and_mlp(block: torch.nn.Module):
+def _get_attn_and_mlp(block: torch.nn.Module) -> Tuple[torch.nn.Module, torch.nn.Module]:
     """Return (attention, mlp) sub-modules regardless of naming."""
     attn_names = ("self_attn", "attn", "attention", "self_attention")
     mlp_names  = ("mlp", "ffn", "feed_forward", "feedforward")
@@ -66,10 +95,20 @@ def _get_attn_and_mlp(block: torch.nn.Module):
 def load_model_and_tokenizer(
     model_name: str = "Qwen/Qwen3-0.6B",
     *,
-    quantization: str | None = None,
-    device_map: str | None = "auto",   # keep "auto" so big models shard
+    quantization: str | None = None,              # "4bit" | "8bit" | None
+    device_map: str | None = "auto",              # keep "auto" so big models shard
+    lora_adapter: str | None = None,              # HF hub id or local path to adapter
+    merge_lora: bool = False,                     # optionally bake adapters into base weights
 ):
-    """Load HF model + tokenizer without DataParallel wrapping."""
+    """
+    Load HF model + tokenizer (optionally in 4/8-bit) and, if requested,
+    attach a LoRA adapter with PEFT for inference.
+
+    Notes:
+    - This function is for inference/feature extraction (not training).
+    - If 'merge_lora' is True and a LoRA adapter is provided/attached,
+      the adapter weights are merged and the PEFT wrapper is removed.
+    """
     LOGGER.info("Loading model %s", model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -86,6 +125,16 @@ def load_model_and_tokenizer(
             model_name, output_hidden_states=True, device_map=device_map
         ).eval()
 
+    if lora_adapter is not None:
+        if not _PEFT_AVAILABLE:
+            raise RuntimeError(
+                "Requested lora_adapter but 'peft' is not installed. Install with: pip install peft"
+            )
+        model = PeftModel.from_pretrained(model, lora_adapter)  # type: ignore
+        if merge_lora and hasattr(model, "merge_and_unload"):
+            model = model.merge_and_unload()  # type: ignore
+
+    model = model.eval()
     return model, tokenizer
 
 
@@ -97,7 +146,9 @@ def _register_block_hooks(model) -> tuple[
     Dict[int, torch.Tensor],
 ]:
     """Attach hooks capturing attention & MLP outputs."""
-    attn_cache, mlp_cache, handles = {}, {}, []
+    attn_cache: Dict[int, torch.Tensor] = {}
+    mlp_cache:  Dict[int, torch.Tensor] = {}
+    handles: List[torch.utils.hooks.RemovableHandle] = []
 
     for idx, block in enumerate(_get_blocks(model)):
         attn_sub, mlp_sub = _get_attn_and_mlp(block)
@@ -115,7 +166,7 @@ def _register_block_hooks(model) -> tuple[
 
 
 # token helpers
-# not used for now but maybe helpful later. I just added the logic into the actual functions
+
 def _find_target_token(tokens: List[str]) -> tuple[int, str]:
     """Last meaningful token (skip eos, punct, pandas dup suffix)."""
     for i in range(len(tokens) - 1, -1, -1):
@@ -174,11 +225,23 @@ def embed_dataset(
     eos_token: str | None = None,
     device: str | None = "auto",
     filter_non_text: bool = False,
+    # LoRA
+    lora_adapter: str | None = None,
+    merge_lora: bool = False,
+    # NEW: quantization passthrough
+    quantization: str | None = None,  # "4bit" | "8bit" | None
 ):
     """
     Extract embeddings with multiple pooling strategies and save CSVs.
     If filter_non_text is True, skip pure-punct/symbol tokens, pandas-duplicate suffixes,
-    and any token containing "end_of_turn". Otherwise include all tokens.
+    and any token containing the provided eos_token string. Otherwise include all tokens.
+
+    LoRA:
+    - Provide `lora_adapter` (HF repo id or local path) to load and apply an adapter for inference.
+    - Set `merge_lora=True` to bake adapters into the base weights (optional).
+
+    Quantization:
+    - Set `quantization` to "4bit" or "8bit" to load quantized base weights for low-VRAM inference.
     """
     # ------------- load / setup -------------
     if isinstance(data, (str, os.PathLike)):
@@ -194,7 +257,13 @@ def embed_dataset(
     if isinstance(pooling, str):
         pooling = [pooling]
 
-    model, tokenizer = load_model_and_tokenizer(model_name, device_map=device)
+    model, tokenizer = load_model_and_tokenizer(
+        model_name,
+        device_map=device,
+        lora_adapter=lora_adapter,
+        merge_lora=merge_lora,
+        quantization=quantization,  # <-- pass through
+    )
     n_layers = len(_get_blocks(model))
     layers   = layers or list(range(n_layers))
     parts    = parts  or ["rs", "attn", "mlp"]
@@ -203,7 +272,7 @@ def embed_dataset(
 
     try:
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Embedding"):
-            prompt = row[input_col] #+ (eos_token or "")
+            prompt = row[input_col]
             enc    = tokenizer(prompt, return_tensors="pt")
             dev    = _primary_device(model)
             enc    = {k: v.to(dev) for k, v in enc.items()}
@@ -215,15 +284,14 @@ def embed_dataset(
             tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"][0].tolist())
 
             if filter_non_text:
-                # filtering behavior
+                # guard eos_token is None
                 valid_idxs = [
                     i for i, tok in enumerate(tokens)
                     if not _SKIP_PUNCT_RE.match(tok)
                        and not _SKIP_DUP_RE.match(tok)
-                       and eos_token not in tok
+                       and (eos_token is None or eos_token not in tok)
                 ]
             else:
-                # include all tokens
                 valid_idxs = list(range(len(tokens)))
 
             row_id = row.get("id", f"row_{idx}")
@@ -265,19 +333,37 @@ def embed(
     eos_token: str | None = None,
     device: str | None = "auto",
     filter_non_text: bool = False,
+    # LoRA
+    lora_adapter: str | None = None,
+    merge_lora: bool = False,
+    # NEW: quantization passthrough
+    quantization: str | None = None,  # "4bit" | "8bit" | None
 ) -> Dict[str, Dict[int, Dict[str, Dict[str, np.ndarray]]]]:
     """
     Return embeddings with multiple pooling strategies.
 
     If filter_non_text is True, skip punct/symbol tokens, pandas-duplicate suffixes,
-    and "end_of_turn"; otherwise include all tokens so first/last map to true ends.
+    and any tokens containing eos_token; otherwise include all tokens.
+
+    LoRA:
+    - Provide `lora_adapter` (HF repo id or local path) to load and apply an adapter for inference.
+    - Set `merge_lora=True` to bake adapters into the base weights (optional).
+
+    Quantization:
+    - Set `quantization` to "4bit" or "8bit" to load quantized base weights for low-VRAM inference.
     """
     if isinstance(inputs, str):
         inputs = [inputs]
     if isinstance(pooling, str):
         pooling = [pooling]
 
-    model, tokenizer = load_model_and_tokenizer(model_name, device_map=device)
+    model, tokenizer = load_model_and_tokenizer(
+        model_name,
+        device_map=device,
+        lora_adapter=lora_adapter,
+        merge_lora=merge_lora,
+        quantization=quantization,  # <-- pass through
+    )
     n_layers = len(_get_blocks(model))
     layers   = layers or list(range(n_layers))
     parts    = parts  or ["rs", "attn", "mlp"]
@@ -287,7 +373,7 @@ def embed(
 
     try:
         for s in tqdm(inputs, desc="Embedding"):
-            prompt = s #+ (eos_token or "")
+            prompt = s
             enc    = tokenizer(prompt, return_tensors="pt")
             dev    = _primary_device(model)
             enc    = {k: v.to(dev) for k, v in enc.items()}
@@ -303,7 +389,7 @@ def embed(
                     i for i, tok in enumerate(tokens)
                     if not _SKIP_PUNCT_RE.match(tok)
                        and not _SKIP_DUP_RE.match(tok)
-                       and eos_token not in tok
+                       and (eos_token is None or eos_token not in tok)
                 ]
             else:
                 valid_idxs = list(range(len(tokens)))
