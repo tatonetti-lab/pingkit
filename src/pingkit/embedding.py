@@ -11,10 +11,11 @@ __all__ = ["load_model_and_tokenizer", "embed_dataset", "embed"]
 
 # try PEFT lazily so base use still works without the dependency
 try:
-    from peft import PeftModel
+    from peft import PeftModel, PeftConfig
     _PEFT_AVAILABLE = True
 except Exception:
-    PeftModel = None  # type: ignore
+    PeftModel = None        # type: ignore
+    PeftConfig = None       # type: ignore
     _PEFT_AVAILABLE = False
 
 # skip pure punctuation/symbol tokens
@@ -95,47 +96,63 @@ def _get_attn_and_mlp(block: torch.nn.Module) -> Tuple[torch.nn.Module, torch.nn
 def load_model_and_tokenizer(
     model_name: str = "Qwen/Qwen3-0.6B",
     *,
-    quantization: str | None = None,              # "4bit" | "8bit" | None
-    device_map: str | None = "auto",              # keep "auto" so big models shard
-    lora_adapter: str | None = None,              # HF hub id or local path to adapter
-    merge_lora: bool = False,                     # optionally bake adapters into base weights
+    quantization: str | None = None,        # "4bit" | "8bit" | None
+    device_map: str | None = "auto",
+    lora_adapter: str | None = None,
+    merge_lora: bool = False,
+    attn_implementation: str | None = None  # e.g., "eager" for Gemma2
 ):
-    """
-    Load HF model + tokenizer (optionally in 4/8-bit) and, if requested,
-    attach a LoRA adapter with PEFT for inference.
-
-    Notes:
-    - This function is for inference/feature extraction (not training).
-    - If 'merge_lora' is True and a LoRA adapter is provided/attached,
-      the adapter weights are merged and the PEFT wrapper is removed.
-    """
     LOGGER.info("Loading model %s", model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    if quantization == "4bit":
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, load_in_4bit=True, device_map=device_map
-        )
-    elif quantization == "8bit":
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, load_in_8bit=True, device_map=device_map
-        )
-    else:
-        model = AutoModel.from_pretrained(
-            model_name, output_hidden_states=True, device_map=device_map
-        ).eval()
-
+    # Resolve base/task from adapter if provided
     if lora_adapter is not None:
         if not _PEFT_AVAILABLE:
             raise RuntimeError(
-                "Requested lora_adapter but 'peft' is not installed. Install with: pip install peft"
+                "lora_adapter was provided but 'peft' is not installed. "
+                "Install with: pip install peft"
             )
-        model = PeftModel.from_pretrained(model, lora_adapter)  # type: ignore
-        if merge_lora and hasattr(model, "merge_and_unload"):
-            model = model.merge_and_unload()  # type: ignore
+        peft_cfg = PeftConfig.from_pretrained(lora_adapter)
+        base_name = peft_cfg.base_model_name_or_path or model_name
+        task_type = str(peft_cfg.task_type).lower()
+        if attn_implementation is None:
+            attn_implementation = "eager"   # Gemma2 safe default
+    else:
+        base_name = model_name
+        task_type = "causal_lm"  # sensible default for LLMs
 
-    model = model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(base_name)
+    if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
+        tokenizer.pad_token = tokenizer.eos_token
+
+    use_causal = (lora_adapter is not None) or ("causal" in task_type)
+    loader = AutoModelForCausalLM if use_causal else AutoModel
+
+    # Build kwargs selectively
+    kw = {}
+    if device_map is not None:
+        kw["device_map"] = device_map
+    if attn_implementation is not None:
+        kw["attn_implementation"] = attn_implementation
+    if quantization == "4bit":
+        kw["load_in_4bit"] = True
+    elif quantization == "8bit":
+        kw["load_in_8bit"] = True
+
+    model = loader.from_pretrained(base_name, **kw)
+
+    # Make sure hidden states are returned
+    if getattr(model.config, "output_hidden_states", False) is not True:
+        model.config.output_hidden_states = True
+
+    # Attach LoRA if provided
+    if lora_adapter is not None:
+        model = PeftModel.from_pretrained(model, lora_adapter)
+        if merge_lora and hasattr(model, "merge_and_unload"):
+            model = model.merge_and_unload()
+
+    model.eval()
     return model, tokenizer
+
 
 
 # hooks
