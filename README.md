@@ -27,7 +27,7 @@ Alternatively, clone the repo and install in editable mode:
 
 ```bash
 git clone https://github.com/tatonetti-lab/pingkit.git
-cd ping
+cd pingkit
 pip install -e .
 ```
 
@@ -49,10 +49,13 @@ Below is a listing of all public functions and classes in each module, along wit
 
 ```python
 def load_model_and_tokenizer(
-    model_name: str = "google/gemma-2b-it",
+    model_name: str = "Qwen/Qwen3-0.6B",
     *,
-    quantization: str | None = None,
+    quantization: str | None = None,        # "4bit" | "8bit" | None
     device_map: str | None = "auto",
+    lora_adapter: str | None = None,        # HF repo id or local path
+    merge_lora: bool = False,
+    attn_implementation: str | None = None  # e.g., "eager" for Gemma2
 ) -> tuple[torch.nn.Module, transformers.PreTrainedTokenizer]
 ```
 
@@ -71,7 +74,7 @@ def embed_dataset(
     data: Union[pd.DataFrame, str, Iterable[str]],
     *,
     input_col: str | None = None,
-    model_name: str = "google/gemma-2b-it",
+    model_name: str = "Qwen/Qwen3-0.6B",
     output_dir: str = "embeddings",
     layers: List[int] | None = None,
     parts: List[str] | None = None,
@@ -79,6 +82,11 @@ def embed_dataset(
     eos_token: str | None = None,
     device: str | None = "auto",
     filter_non_text: bool = False,
+    # LoRA
+    lora_adapter: str | None = None,
+    merge_lora: bool = False,
+    # Quantization passthrough
+    quantization: str | None = None,  # "4bit" | "8bit" | None
 )
 ```
 
@@ -119,14 +127,19 @@ def embed_dataset(
 def embed(
     inputs: Union[str, List[str]],
     *,
-    model_name: str = "google/gemma-2b-it",
+    model_name: str = "Qwen/Qwen3-0.6B",
     layers: List[int] | None = None,
     parts: List[str] | None = None,
     pooling: Union[str, List[str]] = "last",
     eos_token: str | None = None,
     device: str | None = "auto",
     filter_non_text: bool = False,
-) -> Dict[str, Dict[int, Dict[str, Dict[str, np.ndarray]]]]:
+    # LoRA
+    lora_adapter: str | None = None,
+    merge_lora: bool = False,
+    # Quantization passthrough
+    quantization: str | None = None,  # "4bit" | "8bit" | None
+) -> Dict[str, Dict[int, Dict[str, Dict[str, np.ndarray]]]]
 ```
 
 * **Description**: Returns embeddings in memory (no file I/O) for one or multiple input strings.
@@ -218,21 +231,24 @@ def fit(
     X: Union[pd.DataFrame, np.ndarray],
     y: Union[pd.Series, np.ndarray],
     *,
-    model: str = "mlp",
+    model: str | Callable = "mlp",
     meta: dict | None = None,
     num_classes: int = 2,
     n_epochs: int = 300,
     learning_rate: float = 1e-3,
     batch_size: int = 256,
     device: str | torch.device = "cuda",
-    contrastive_weight: float = 1.0,
+    contrastive_weight: float = 1.0,        # used for "cnn"
     validation_data: Tuple[Union[pd.DataFrame, np.ndarray], np.ndarray] | None = None,
     val_split: float | None = None,
-    metric: str | Callable[[np.ndarray, np.ndarray], float] = "roc_auc",
+    eval_metric: str | Callable[[np.ndarray, np.ndarray], float] = "roc_auc",
     early_stopping: bool = True,
     patience: int = 10,
     random_state: int | None = 101,
-) -> Tuple[nn.Module, List[dict]]:
+    class_weight: Union[str, Sequence[float], torch.Tensor, None] = None,
+    loss_fn: Union[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = "ce",  # "ce" | "focal" | callable
+    **model_kwargs,
+) -> Tuple[nn.Module, list[dict]]:
 ```
 
 * **Description**: Trains a model (MLP or CNN) on features `X` and labels `y` using either a provided validation split or an internal `val_split`, with early stopping and training history logging.
@@ -274,8 +290,10 @@ from typing import Tuple
 def save_artifacts(
     model: torch.nn.Module,
     *,
-    path: str = "artifacts/pingkit",
+    path: str = "artifacts/ping",
     meta: dict | None = None,
+    model_factory: Callable | None = None,    # for custom models
+    model_kwargs: dict | None = None,         # persisted for reconstruction
 ) -> Tuple[str, str]:
 ```
 
@@ -320,6 +338,7 @@ def predict(
     response_col: str = "answer",
     device: str = "cuda",
     batch_size: int = 4096,
+    output_dir: str | None = None,
 ) -> pd.DataFrame:
 ```
 
@@ -580,10 +599,10 @@ print("Train:", X_train.shape, "Test:", X_test.shape)
 model, history = fit(
     X_train,
     y_train.values,
-    model_type='mlp',
+    model="mlp",
     meta=meta,
     num_classes=4,
-    metric='loss',
+    eval_metric="loss",
     batch_size=128,
     learning_rate=1e-2,
     contrastive_weight=0.4,
