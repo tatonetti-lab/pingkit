@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 """
-probe_train.py
-==============
 Train a probe on combined embedding data with configurable class balancing,
 hold out a fraction for evaluation, report metrics with bootstrap CIs, and
 save the model.
