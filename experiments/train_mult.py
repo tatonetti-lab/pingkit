@@ -6,7 +6,7 @@ save the model.
 ----------------------------------------------------------------------------
 Example
 -------
-$ python probe_train.py \
+$ python train_mult.py \
       --data_dirs       /path/to/train /path/to/test \
       --labels_csvs     train_labels.csv test_labels.csv \
       --label_col       correct \
