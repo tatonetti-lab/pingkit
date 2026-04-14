@@ -33,8 +33,8 @@ plt.switch_backend("Agg")  # headless‑safe
 
 LOGGER = logging.getLogger(__name__)
 __all__ = [
-    "PingClassifier",
-    "PingContrastiveCNN",
+    "pingClassifier",
+    "pingContrastiveCNN",
     "fit",
     "cross_validate",
     "save_artifacts",
@@ -795,9 +795,6 @@ def _make_validation_split(
 
 # fit
 
-# =====================================================================
-# UPDATED fit()
-# =====================================================================
 def fit(
     X: Union[pd.DataFrame, np.ndarray],
     y: Union[pd.Series, np.ndarray],

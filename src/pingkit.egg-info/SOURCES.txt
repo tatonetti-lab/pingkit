@@ -1,9 +1,10 @@
 LICENSE
-README.md
+README.pypi.md
 pyproject.toml
 src/pingkit/__init__.py
 src/pingkit/embedding.py
 src/pingkit/extraction.py
+src/pingkit/generate.py
 src/pingkit/model.py
 src/pingkit.egg-info/PKG-INFO
 src/pingkit.egg-info/SOURCES.txt

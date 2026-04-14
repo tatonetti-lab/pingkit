@@ -245,8 +245,10 @@ def embed_dataset(
     # LoRA
     lora_adapter: str | None = None,
     merge_lora: bool = False,
-    # NEW: quantization passthrough
+    # quantization passthrough
     quantization: str | None = None,  # "4bit" | "8bit" | None
+    # NEW: attention implementation passthrough
+    attn_implementation: str | None = None,  # e.g. "sdpa" | "eager" | "flash_attention_2"
 ):
     """
     Extract embeddings with multiple pooling strategies and save CSVs.
@@ -259,6 +261,9 @@ def embed_dataset(
 
     Quantization:
     - Set `quantization` to "4bit" or "8bit" to load quantized base weights for low-VRAM inference.
+
+    Attention implementation:
+    - Set `attn_implementation` to e.g. "sdpa" to use PyTorch SDPA attention when supported.
     """
     # ------------- load / setup -------------
     if isinstance(data, (str, os.PathLike)):
@@ -279,7 +284,8 @@ def embed_dataset(
         device_map=device,
         lora_adapter=lora_adapter,
         merge_lora=merge_lora,
-        quantization=quantization,  # <-- pass through
+        quantization=quantization,
+        attn_implementation=attn_implementation,  # <-- added
     )
     n_layers = len(_get_blocks(model))
     layers   = layers or list(range(n_layers))
@@ -301,7 +307,6 @@ def embed_dataset(
             tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"][0].tolist())
 
             if filter_non_text:
-                # guard eos_token is None
                 valid_idxs = [
                     i for i, tok in enumerate(tokens)
                     if not _SKIP_PUNCT_RE.match(tok)
@@ -333,11 +338,12 @@ def embed_dataset(
                         os.makedirs(path_dir, exist_ok=True)
                         path = os.path.join(path_dir, f"{row_id}_L{layer:02d}.csv")
                         pd.DataFrame(
-                            vecs[part].numpy().reshape(-1, 1),
+                            vecs[part].float().numpy().reshape(-1, 1),
                             columns=[key_name]
                         ).to_csv(path, index=False)
     finally:
-        for h in handles: h.remove()
+        for h in handles:
+            h.remove()
 
 
 def embed(
@@ -350,25 +356,12 @@ def embed(
     eos_token: str | None = None,
     device: str | None = "auto",
     filter_non_text: bool = False,
-    # LoRA
     lora_adapter: str | None = None,
     merge_lora: bool = False,
-    # NEW: quantization passthrough
     quantization: str | None = None,  # "4bit" | "8bit" | None
+    # NEW: attention implementation passthrough
+    attn_implementation: str | None = None,  # e.g. "sdpa" | "eager" | "flash_attention_2"
 ) -> Dict[str, Dict[int, Dict[str, Dict[str, np.ndarray]]]]:
-    """
-    Return embeddings with multiple pooling strategies.
-
-    If filter_non_text is True, skip punct/symbol tokens, pandas-duplicate suffixes,
-    and any tokens containing eos_token; otherwise include all tokens.
-
-    LoRA:
-    - Provide `lora_adapter` (HF repo id or local path) to load and apply an adapter for inference.
-    - Set `merge_lora=True` to bake adapters into the base weights (optional).
-
-    Quantization:
-    - Set `quantization` to "4bit" or "8bit" to load quantized base weights for low-VRAM inference.
-    """
     if isinstance(inputs, str):
         inputs = [inputs]
     if isinstance(pooling, str):
@@ -379,7 +372,8 @@ def embed(
         device_map=device,
         lora_adapter=lora_adapter,
         merge_lora=merge_lora,
-        quantization=quantization,  # <-- pass through
+        quantization=quantization,
+        attn_implementation=attn_implementation,  # <-- added
     )
     n_layers = len(_get_blocks(model))
     layers   = layers or list(range(n_layers))
@@ -390,10 +384,9 @@ def embed(
 
     try:
         for s in tqdm(inputs, desc="Embedding"):
-            prompt = s
-            enc    = tokenizer(prompt, return_tensors="pt")
-            dev    = _primary_device(model)
-            enc    = {k: v.to(dev) for k, v in enc.items()}
+            enc = tokenizer(s, return_tensors="pt")
+            dev = _primary_device(model)
+            enc = {k: v.to(dev) for k, v in enc.items()}
 
             attn_cache.clear(); mlp_cache.clear()
             with torch.no_grad():
@@ -413,18 +406,31 @@ def embed(
 
             embeddings[s] = {}
             for layer in layers:
+                if not (0 <= layer < n_layers):
+                    raise ValueError(f"Layer {layer} out of 0-{n_layers-1}")
+
                 seq_rs   = out.hidden_states[layer + 1][0].cpu()
                 seq_attn = attn_cache[layer].cpu()
                 seq_mlp  = mlp_cache[layer].cpu()
 
+                # Prepare storage only for requested parts
                 part_pool: Dict[str, Dict[str, np.ndarray]] = {p: {} for p in parts}
+
                 for method in pooling:
                     key_name = _pool_key(method, tokens, valid_idxs)
-                    part_pool["rs"][key_name]   = _pooled(seq_rs,   valid_idxs, method).numpy()
-                    part_pool["attn"][key_name] = _pooled(seq_attn, valid_idxs, method).numpy()
-                    part_pool["mlp"][key_name]  = _pooled(seq_mlp,  valid_idxs, method).numpy()
+
+                    # Only fill the parts the caller asked for
+                    if "rs" in part_pool:
+                        part_pool["rs"][key_name]   = _pooled(seq_rs,   valid_idxs, method).float().numpy()
+                    if "attn" in part_pool:
+                        part_pool["attn"][key_name] = _pooled(seq_attn, valid_idxs, method).float().numpy()
+                    if "mlp" in part_pool:
+                        part_pool["mlp"][key_name]  = _pooled(seq_mlp,  valid_idxs, method).float().numpy()
+
                 embeddings[s][layer] = part_pool
     finally:
-        for h in handles: h.remove()
+        for h in handles:
+            h.remove()
 
     return embeddings
+
