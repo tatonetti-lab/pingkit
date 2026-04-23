@@ -7,21 +7,6 @@ Line‑sweeps every transformer *layer* in a PingKit embedding directory,
 trains a probe with **k‑fold cross‑validation**, and reports the metric
 (mean ± min/max across folds) so we can spot the "sweet‑spot" layer.
 
------------------------------------------------------------------------
-Example
--------
-$ python layer_eval.py \
-      --embedding_dir mmlu_answer \
-      --labels_csv   mmlu_g.csv \
-      --label_col    answer \
-      --parts        rs \
-      --metric       accuracy \
-      --model_type   mlp \
-      --k_folds      5 \
-      --restack      true \
-      --output       my_results.json
------------------------------------------------------------------------
-
 """
 
 from __future__ import annotations
