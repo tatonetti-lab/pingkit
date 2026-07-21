@@ -37,6 +37,13 @@ pip install -e .
 
 For advanced usage including creating custom models and probes, check out the **Custom Models Tutorial** notebook in the repository examples.
 
+## Reproducing the paper
+
+The [`experiments/`](experiments/) directory holds the analysis scripts and summary
+result files behind the figures and tables in the manuscript. See
+[`experiments/README.md`](experiments/README.md) for a figure/table-to-script index
+and instructions for regenerating the shipped figures.
+
 ---
 
 ## Function Reference
