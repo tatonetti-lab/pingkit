@@ -9,7 +9,7 @@ Scripts are grouped by experiment:
 - `fine_tune_experiments/` — DPO+LoRA refusal analysis on MedMCQA (Figure 3).
 - `simpleqa_experiments/` — SimpleQA correctness probe and BoolQ transfer (Table 2).
 - `general_use/` — reusable drivers (activation extraction, layer sweep, multi-layer training).
-- `results/` — a few small summary files so Figure 2 and Table 1 can be redrawn directly (see below).
+- `results/` — small shipped files so Figure 2, Table 1, and Table 2 can be reproduced directly without a GPU (see below).
 
 ## What you need to reproduce a result
 
@@ -27,7 +27,8 @@ Every result comes from the same three-stage pipeline:
 The raw activations and generations are multi-GB and are **not** shipped. Given the
 embeddings from step 2, the scripts below regenerate each figure and table without
 any further model inference. Figure 2 and Table 1 also ship their small summary
-files under `results/`, so those two can be redrawn with no GPU at all.
+files under `results/`, and Table 2 ships its trained probes, metrics, and
+evaluation logs under `results/table2/`, so those can be reproduced with no GPU at all.
 
 Open-weight models used: `google/gemma-2-2b-it`, `google/gemma-2-9b-it`,
 `meta-llama/Llama-3.1-8B`, `meta-llama/Llama-3.1-8B-Instruct`,
@@ -46,7 +47,7 @@ Open-weight models used: `google/gemma-2-2b-it`, `google/gemma-2-9b-it`,
 | **Fig. 3B** | DPO outcomes (refused/correct/incorrect), stratified by base correctness | `fine_tune_experiments/train.py` (DPO+LoRA), `fine_tune_experiments/eval.py`, `fine_tune_experiments/correct_refusal.py`, `fine_tune_experiments/incorrect_refusal.py` | DPO fine-tune, run `eval.py` over MedMCQA, then the refusal-tally scripts |
 | **Fig. 3C** | Layer-wise probe accuracy on the refused subset | `fine_tune_experiments/embed.py`, `fine_tune_experiments/split.py`, `fine_tune_experiments/subset_correct.py`, `fine_tune_experiments/subset_incorrect.py`, `fine_tune_experiments/train_ping.py`, `fine_tune_experiments/knowledge_lost.py`, `fine_tune_experiments/knowledge_neverhad.py`. Sweep: `general_use/layer_eval.py` | Embed the refused subset, then run `general_use/layer_eval.py` on those embeddings |
 | **Fig. 4** | Component ablation (residual / attention / MLP), layer-wise | Sweep: `mmlu/layer_eval_ab.py`. Plot: `mmlu/plot_ab.py` | Embed with all three component types retained, run `layer_eval_ab.py`, then `plot_ab.py --json_file <sweep>.json` |
-| **Table 2** | SimpleQA correctness probe + BoolQ transfer | SimpleQA: `simpleqa_experiments/llm_gen_answers.py`, `simpleqa_experiments/check_acc.py`, `simpleqa_experiments/run.py`. BoolQ: `simpleqa_experiments/llm_gen_answers_boolq.py`, `simpleqa_experiments/check_acc_bool.py`, `simpleqa_experiments/split_boolq.py`, `simpleqa_experiments/bool_eval.py` | Generate answers, score with the GPT judge, embed the last generated token, then `bool_eval.py` for the probe |
+| **Table 2** | SimpleQA correctness probe + BoolQ transfer | SimpleQA in-domain: `simpleqa_experiments/llm_gen_answers.py`, `simpleqa_experiments/check_acc.py`, `simpleqa_experiments/split_simpleqa.py`, `simpleqa_experiments/train_correctness.py` (driver: `simpleqa_experiments/run_simpleqa_eval.sh`). BoolQ transfer/reference: `simpleqa_experiments/llm_gen_answers_boolq.py`, `simpleqa_experiments/check_acc_bool.py`, `simpleqa_experiments/split_boolq.py`, `simpleqa_experiments/bool_eval.py`. (`simpleqa_experiments/run.py` is an optional single-question inference demo, not part of the table.) | Shipped: trained probes + metrics + eval logs under `results/table2/` verify all three rows with no GPU. From scratch: generate answers, score with the GPT judge, embed the last generated token, then `run_simpleqa_eval.sh` (in-domain) and `bool_eval.py` (transfer) |
 | **Table 3** | MMLU subject classification (57 subjects) | `mmlu/train_subject.py` | Embed MMLU, then `train_subject.py` with the subject label column |
 | **Table 4** | Single-layer vs. multi-layer probes | `mmlu/train_multilayer.py`, `general_use/train_mult.py` | Embed with multiple layers retained, then `train_multilayer.py` / `train_mult.py` |
 

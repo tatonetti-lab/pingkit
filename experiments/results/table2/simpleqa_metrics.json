@@ -1,0 +1,108 @@
+{
+  "args": {
+    "data_dirs": [
+      "/home/berkowitzj2/scratch/simpleqa_train",
+      "/home/berkowitzj2/scratch/simpleqa_test"
+    ],
+    "labels_csvs": [
+      "simpleqa_train.csv",
+      "simpleqa_test.csv"
+    ],
+    "label_col": "correct",
+    "id_col": "id",
+    "parts": "rs",
+    "layers": [
+      39
+    ],
+    "model_type": "mlp",
+    "restack": "false",
+    "train_class_sizes": [
+      300,
+      200
+    ],
+    "holdout_frac": 0.05,
+    "output": "sqa_model",
+    "n_epochs": 100,
+    "batch_size": 128,
+    "learning_rate": 0.001,
+    "val_split": 0.1,
+    "patience": 5,
+    "random_state": 42,
+    "bootstrap_B": 1000,
+    "bootstrap_seed": 8675309,
+    "ece_bins": 10,
+    "device": "cuda"
+  },
+  "layers": [
+    39
+  ],
+  "point": {
+    "accuracy": 0.8166043780032034,
+    "macro_accuracy": 0.6399879558503767,
+    "auc": 0.7525984563261666,
+    "brier": 0.13244502964450292,
+    "ece": 0.05365868441828162
+  },
+  "per_class": {
+    "0": {
+      "accuracy": 0.8223487930566856,
+      "correct": 3032,
+      "total": 3687,
+      "avg_pred": 0.2936096489429474
+    },
+    "1": {
+      "accuracy": 0.4576271186440678,
+      "correct": 27,
+      "total": 59,
+      "avg_pred": 0.48715585470199585
+    },
+    "macro_avg": 0.6399879558503767
+  },
+  "ci_95": {
+    "accuracy": {
+      "low": 0.8037907100907635,
+      "high": 0.8278230112119593
+    },
+    "auc": {
+      "low": 0.7008289546873347,
+      "high": 0.8059658764417353
+    },
+    "brier": {
+      "low": 0.12697102565220786,
+      "high": 0.1379354893001055
+    },
+    "ece": {
+      "low": 0.04262837231700203,
+      "high": 0.06487583971785724
+    }
+  },
+  "bootstrap": {
+    "B": 1000,
+    "seed": 8675309,
+    "ece_bins": [
+      0.0,
+      0.1,
+      0.2,
+      0.30000000000000004,
+      0.4,
+      0.5,
+      0.6000000000000001,
+      0.7000000000000001,
+      0.8,
+      0.9,
+      1.0
+    ]
+  },
+  "dataset": {
+    "total_samples": 4246,
+    "train_samples": 500,
+    "holdout_samples": 3746,
+    "num_features": 3584,
+    "num_classes": 2,
+    "holdout_frac": 0.05,
+    "train_class_sizes": [
+      300,
+      200
+    ]
+  }
+}
