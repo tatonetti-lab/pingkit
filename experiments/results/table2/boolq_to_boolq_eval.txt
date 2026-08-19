@@ -1,0 +1,59 @@
+[20:46:07] INFO: pingClassifier • d=3584 N=585 target=5.0 ⇒ fc1=16 params=58610 (≈100.2×N)
+/home/berkowitzj2/.local/lib/python3.9/site-packages/pingkit/model.py:633: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  model.load_state_dict(torch.load(weights_path, map_location=device))
+[20:46:07] INFO: Loaded model ← boolq_model.pt (device=cpu)
+Layers: [39]
+Parts: ['rs']
+Device: cuda
+Artifact dir: boolq_model
+Loaded 1680 samples, 3584 features
+Classes: 2
+  Class 0: 840
+  Class 1: 840
+
+Loading probe from boolq_model...
+Running inference...
+
+============================================================
+RESULTS
+============================================================
+
+  Overall:
+    Accuracy: 0.6185
+
+  Per-Class:
+    Class             Acc    Correct    AvgPred
+    ------------ -------- ---------- ----------
+    0              0.7119   598/840      0.3423
+    1              0.5250   441/840      0.5101
+    Macro          0.6185
+
+    AUC:   0.6785
+    Brier: 0.2462
+    ECE:   0.1328
+
+  Calibration by confidence bin (10 bins over [0.5, 1.0]):
+    Bin                 N     Frac      Acc    AvgConf        Gap      |Gap|  ECE contrib
+    ------------- ------- -------- -------- ---------- ---------- ---------- ------------
+    [0.50,0.55)       131    0.078   0.4885   0.5264  -0.0379   0.0379     0.002952
+    [0.55,0.60)       153    0.091   0.4967   0.5752  -0.0785   0.0785     0.007149
+    [0.60,0.65)       155    0.092   0.5226   0.6250  -0.1024   0.1024     0.009446
+    [0.65,0.70)       168    0.100   0.5655   0.6762  -0.1107   0.1107     0.011069
+    [0.70,0.75)       195    0.116   0.5436   0.7228  -0.1792   0.1792     0.020797
+    [0.75,0.80)       192    0.114   0.6979   0.7755  -0.0776   0.0776     0.008871
+    [0.80,0.85)       212    0.126   0.6604   0.8269  -0.1665   0.1665     0.021012
+    [0.85,0.90)       224    0.133   0.6830   0.8737  -0.1907   0.1907     0.025425
+    [0.90,0.95)       174    0.104   0.7069   0.9226  -0.2157   0.2157     0.022338
+    [0.95,1.00]        76    0.045   0.8816   0.9636  -0.0820   0.0820     0.003711
+
+    ECE check (sum of bin contribs): 0.132770
+
+  Bootstrap CIs (B=1000):
+    Accuracy: [0.5952, 0.6405]
+    AUC:      [0.6518, 0.7044]
+    Brier:    [0.2339, 0.2584]
+    ECE:      [0.1122, 0.1563]
+
+Predictions saved to: /home/berkowitzj2/scratch/boolq_test/predictions.csv
+
+Summary: ACC 0.6185 [0.5952, 0.6405] | Macro ACC 0.6185 | AUC 0.6785 [0.6518, 0.7044] | Brier 0.2462 [0.2339, 0.2584] | ECE 0.1328 [0.1122, 0.1563]

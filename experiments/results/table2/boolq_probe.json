@@ -1,0 +1,16 @@
+{
+  "model_type": "mlp",
+  "num_classes": 2,
+  "input_dim": 3584,
+  "n_examples": 585,
+  "target_ratio": 5.0,
+  "p_drop": 0.3,
+  "width_cap": 128,
+  "parts": [
+    "rs"
+  ],
+  "layers": [
+    39
+  ],
+  "hidden_size": 3584
+}
